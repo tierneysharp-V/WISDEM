@@ -80,6 +80,28 @@ class PreDiscretization(om.ExplicitComponent):
         outputs["constr_diam_consistency"] = inputs["tower_base_diameter"] / inputs["monopile_top_diameter"]
 
 
+class MonopileHeightAirgapConstraint(om.ExplicitComponent):
+    """
+    Clearance metric for monopile height vs site water depth and waves.
+
+    monopile_height_above_wave = monopile_height - water_depth - Hsig_wave
+
+    Constrained in optimization with lower bound = air_gap + safety_margin, i.e.
+    height >= water_depth + Hsig_wave + air_gap + safety_margin.
+    """
+
+    def setup(self):
+        self.add_input("monopile_height", val=0.0, units="m")
+        self.add_input("water_depth", val=0.0, units="m")
+        self.add_input("Hsig_wave", val=0.0, units="m")
+        self.add_output("monopile_height_above_wave", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["monopile_height_above_wave"] = (
+            inputs["monopile_height"] - inputs["water_depth"] - inputs["Hsig_wave"]
+        )
+
+
 class MonopileMass(om.ExplicitComponent):
     """
     Compute the tower and monopile masses, raw cost, and CG properties.
@@ -737,6 +759,7 @@ class MonopileSEProp(om.Group):
         n_full = mem.get_nfull(n_height, nref=nref)
 
         self.add_subsystem("predis", PreDiscretization(), promotes=["*"])
+        self.add_subsystem("height_airgap", MonopileHeightAirgapConstraint(), promotes=["*"])
 
         promlist = [
             "E_mat",

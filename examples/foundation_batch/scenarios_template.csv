@@ -1,0 +1,2 @@
+water_depth_m,Hs50_m,Tp50_s,soil_shear_modulus_Pa,tower_base_shear_N,tower_base_vertical_N,tower_base_overturning_moment_Nm
+30.0,4.52,9.45,140000000.0,1284744.0,-2914124.0,3963732.76208099

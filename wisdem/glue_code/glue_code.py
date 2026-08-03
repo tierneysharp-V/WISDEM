@@ -620,6 +620,8 @@ class WT_RNTA(om.Group):
                 self.connect("drivese.rna_mass", "fixedse.rna_mass")
 
         if modeling_options["flags"]["jacket"]:
+            self.connect("env.water_depth", "fixedse.water_depth")
+            self.connect("env.Hsig_wave", "fixedse.Hsig_wave")
             self.connect("jacket.transition_piece_cost", "fixedse.transition_piece_cost")
             self.connect("jacket.transition_piece_mass", "fixedse.transition_piece_mass")
             self.connect("jacket.foot_head_ratio", "fixedse.foot_head_ratio")
@@ -991,7 +993,11 @@ class WindPark(om.Group):
                 self.connect("costs.turbine_number", "orbit.number_of_turbines")
                 self.connect("configuration.n_blades", "orbit.number_of_blades")
                 self.connect("high_level_tower_props.hub_height", "orbit.hub_height")
-                self.connect("blade.high_level_blade_props.rotor_diameter", "orbit.turbine_rotor_diameter")
+                if modeling_options["flags"]["blade"] or modeling_options["user_elastic"]["blade"]:
+                    self.connect("blade.high_level_blade_props.rotor_diameter", "orbit.turbine_rotor_diameter")
+                else:
+                    # Foundation-only runs: use assembly rotor diameter; ORBIT keeps other turbine defaults
+                    self.connect("configuration.rotor_diameter_user", "orbit.turbine_rotor_diameter")
                 self.connect("tower_grid.height", "orbit.tower_length")
                 if modeling_options["flags"]["tower"]:
                     self.connect("towerse.tower_mass", "orbit.tower_mass")
@@ -1020,10 +1026,12 @@ class WindPark(om.Group):
                     self.connect("floatingse.platform_cost", "orbit.floating_substructure_cost")
                 if modeling_options["flags"]["drivetrain"]:
                     self.connect("drivese.nacelle_mass", "orbit.nacelle_mass")
-                self.connect("rotorse.blade_mass", "orbit.blade_mass")
-                self.connect("tcc.turbine_cost_kW", "orbit.turbine_capex")
-                self.connect("rotorse.wt_class.V_mean", "orbit.site_mean_windspeed")
-                self.connect("rotorse.rp.powercurve.rated_V", "orbit.turbine_rated_windspeed")
+                # RotorSE/TCC outputs only exist when those modules are active; otherwise ORBIT defaults apply
+                if modeling_options["flags"]["blade"]:
+                    self.connect("rotorse.blade_mass", "orbit.blade_mass")
+                    self.connect("rotorse.wt_class.V_mean", "orbit.site_mean_windspeed")
+                    self.connect("rotorse.rp.powercurve.rated_V", "orbit.turbine_rated_windspeed")
+                    self.connect("tcc.turbine_cost_kW", "orbit.turbine_capex")
                 self.connect("bos.plant_turbine_spacing", "orbit.plant_turbine_spacing")
                 self.connect("bos.plant_row_spacing", "orbit.plant_row_spacing")
                 self.connect("bos.commissioning_cost_kW", "orbit.commissioning_cost_kW")

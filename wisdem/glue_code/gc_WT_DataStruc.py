@@ -2033,6 +2033,34 @@ class Compute_Grid(om.ExplicitComponent):
         partials["s", "ref_axis"] = (low_d_high - high_d_low) / arc_distances[-1] ** 2
 
 
+class BuildMonopileRefAxis(om.ExplicitComponent):
+    """
+    Rebuild monopile ref_axis from total height and fixed top elevation.
+
+    Keeps the nondimensional grid ``s_grid`` and transition-piece elevation ``z_top``
+    fixed while ``height_in`` is a design variable:
+        z(s) = z_top - height_in * (1 - s)
+    """
+
+    def initialize(self):
+        self.options.declare("n_height")
+
+    def setup(self):
+        n_height = self.options["n_height"]
+        self.add_input("height_in", val=0.0, units="m")
+        self.add_input("z_top", val=0.0, units="m")
+        self.add_input("s_grid", val=np.linspace(0.0, 1.0, n_height))
+        self.add_output("ref_axis", val=np.zeros((n_height, 3)), units="m")
+
+    def compute(self, inputs, outputs):
+        s = np.asarray(inputs["s_grid"], dtype=float).flatten()
+        z_top = float(inputs["z_top"][0])
+        height = float(inputs["height_in"][0])
+        outputs["ref_axis"][:, 0] = 0.0
+        outputs["ref_axis"][:, 1] = 0.0
+        outputs["ref_axis"][:, 2] = z_top - height * (1.0 - s)
+
+
 class Monopile(om.Group):
     def initialize(self):
         self.options.declare("fixedbottomse_options")
@@ -2077,8 +2105,36 @@ class Monopile(om.Group):
             units="kg",
             desc="Override bottom-up calculation of total monopile mass with this value",
         )
+        ivc.add_output(
+            "height_in",
+            val=0.0,
+            units="m",
+            desc="Overall monopile height (design variable). Bottom elevation is z_top - height_in.",
+        )
+        ivc.add_output(
+            "z_top",
+            val=0.0,
+            units="m",
+            desc="Monopile top / transition-piece elevation above MSL.",
+        )
+        ivc.add_output(
+            "s_grid",
+            val=np.linspace(0.0, 1.0, n_height),
+            desc="Nondimensional monopile grid (0 at pile tip, 1 at transition piece).",
+        )
 
-        self.add_subsystem("compute_monopile_grid", Compute_Grid(n_height=n_height), promotes=["*"])
+        self.add_subsystem(
+            "build_axis",
+            BuildMonopileRefAxis(n_height=n_height),
+            promotes_inputs=["height_in", "z_top", "s_grid"],
+            promotes_outputs=["ref_axis"],
+        )
+        self.add_subsystem(
+            "compute_monopile_grid",
+            Compute_Grid(n_height=n_height),
+            promotes_outputs=["height", "length", "s", "foundation_height"],
+        )
+        self.connect("ref_axis", "compute_monopile_grid.ref_axis")
 
 
 class Jacket(om.Group):

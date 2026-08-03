@@ -439,6 +439,20 @@ properties:
                                 unit: m
                                 description: Design variable bound
                             upper_bound: *sbound
+                    height:
+                        type: object
+                        default: {}
+                        description: Adjust the overall monopile height (mudline embedment through transition piece)
+                        properties:
+                            flag: *flag
+                            lower_bound: &mono_h_bound
+                                type: number
+                                minimum: 1.0
+                                maximum: 500.0
+                                default: 30.0
+                                unit: m
+                                description: Design variable bound
+                            upper_bound: *mono_h_bound
                     E:
                         type: object
                         default: {}
@@ -1215,7 +1229,67 @@ properties:
                         default: {}
                         properties:
                             flag: *flag
-            jacket: *moncon
+                    height_airgap:
+                        type: object
+                        description: Ensures monopile height is at least water depth + significant wave height + air gap + safety margin
+                        default: {}
+                        properties:
+                            flag: *flag
+                            air_gap:
+                                type: number
+                                minimum: 0.0
+                                maximum: 50.0
+                                default: 1.5
+                                unit: m
+                                description: Required clearance above MSL + 50-year significant wave height
+                            safety_margin:
+                                type: number
+                                minimum: 0.0
+                                maximum: 50.0
+                                default: 4.0
+                                unit: m
+                                description: Additional safety margin added on top of air gap for monopile height
+            jacket:
+                type: object
+                default: {}
+                description: Constraints associated with the jacket design
+                properties:
+                    stress: *vonmises
+                    global_buckling: *globalb
+                    shell_buckling: *shellb
+                    slope: *slope
+                    thickness_slope: *thick_slope
+                    d_to_t: *d_to_t
+                    taper: *taper
+                    frequency_1: *towfreq1
+                    mass: *mass_constr
+                    tower_diameter_coupling:
+                        type: object
+                        description: Ensures that the jacket head radius is consistent with the tower base diameter
+                        default: {}
+                        properties:
+                            flag: *flag
+                    height_airgap:
+                        type: object
+                        description: Ensures jacket height is at least water depth + significant wave height + air gap + safety margin
+                        default: {}
+                        properties:
+                            flag: *flag
+                            air_gap:
+                                type: number
+                                minimum: 0.0
+                                maximum: 50.0
+                                default: 1.5
+                                unit: m
+                                description: Required clearance of jacket top above MSL + 50-year significant wave height
+                            safety_margin:
+                                type: number
+                                minimum: 0.0
+                                maximum: 50.0
+                                default: 4.0
+                                unit: m
+                                description: Additional safety margin added on top of air gap for jacket height
+
             hub:
                 type: object
                 default: {}

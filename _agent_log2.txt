@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "/home/s2795056/projects/GitHub/WISDEM/_agent_import_test.py", line 1, in <module>
+    import wisdem
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/__init__.py", line 3, in <module>
+    from wisdem.glue_code.runWISDEM import run_wisdem
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/glue_code/runWISDEM.py", line 14, in <module>
+    from wisdem.glue_code.glue_code import WindPark
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/glue_code/glue_code.py", line 4, in <module>
+    from wisdem.rotorse.rotor import RotorSE, RotorSEPerf, RotorSEProp
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/rotorse/rotor.py", line 4, in <module>
+    from wisdem.rotorse.rotor_power import RotorPower, NoStallConstraint
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/rotorse/rotor_power.py", line 16, in <module>
+    from wisdem.ccblade.ccblade import CCBlade, CCAirfoil
+  File "/home/s2795056/projects/GitHub/WISDEM/wisdem/ccblade/ccblade.py", line 31, in <module>
+    import wisdem.ccblade._bem as _bem
+ModuleNotFoundError: No module named 'wisdem.ccblade._bem'
+EXIT:True

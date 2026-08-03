@@ -121,6 +121,28 @@ class ComputeJacketNodes(om.ExplicitComponent):
         outputs["constr_diam_consistency"] = inputs["tower_base_diameter"] / r_head
 
 
+class JacketHeightAirgapConstraint(om.ExplicitComponent):
+    """
+    Clearance metric for jacket height vs site water depth and waves.
+
+    jacket_height_above_wave = height - water_depth - Hsig_wave
+
+    Constrained in optimization with lower bound = air_gap + safety_margin, i.e.
+    height >= water_depth + Hsig_wave + air_gap + safety_margin.
+    """
+
+    def setup(self):
+        self.add_input("height", val=70.0, units="m")
+        self.add_input("water_depth", val=0.0, units="m")
+        self.add_input("Hsig_wave", val=0.0, units="m")
+        self.add_output("jacket_height_above_wave", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["jacket_height_above_wave"] = (
+            inputs["height"] - inputs["water_depth"] - inputs["Hsig_wave"]
+        )
+
+
 class ComputeFrame3DD(om.ExplicitComponent):
     """
     Now that we have modal information of the jacket structure, we construct the
@@ -778,6 +800,7 @@ class JacketSEProp(om.Group):
 
         self.add_subsystem("pre", PreDiscretization(), promotes=["*"])
         self.add_subsystem("nodes", ComputeJacketNodes(modeling_options=modeling_options), promotes=["*"])
+        self.add_subsystem("height_airgap", JacketHeightAirgapConstraint(), promotes=["*"])
 
 
 class JacketSEPerf(om.Group):

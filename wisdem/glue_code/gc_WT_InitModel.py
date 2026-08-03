@@ -1066,24 +1066,18 @@ def assign_monopile_values(wt_opt, modeling_options, monopile):
         ]
     )
 
-    wt_opt["monopile.s"] = svec
+    wt_opt["monopile.s_grid"] = svec
     wt_opt["monopile.diameter"] = PchipInterpolator(
         monopile["outer_shape"]["outer_diameter"]["grid"],
         monopile["outer_shape"]["outer_diameter"]["values"],
     )(svec)
 
-    wt_opt["monopile.ref_axis"][:, 0] = PchipInterpolator(
-        monopile["reference_axis"]["x"]["grid"],
-        monopile["reference_axis"]["x"]["values"],
-    )(svec)
-    wt_opt["monopile.ref_axis"][:, 1] = PchipInterpolator(
-        monopile["reference_axis"]["y"]["grid"],
-        monopile["reference_axis"]["y"]["values"],
-    )(svec)
-    wt_opt["monopile.ref_axis"][:, 2] = PchipInterpolator(
+    z_vals = PchipInterpolator(
         monopile["reference_axis"]["z"]["grid"],
         monopile["reference_axis"]["z"]["values"],
     )(svec)
+    wt_opt["monopile.z_top"] = float(z_vals[-1])
+    wt_opt["monopile.height_in"] = float(z_vals[-1] - z_vals[0])
 
     layer_name = n_layers * [""]
     layer_mat = n_layers * [""]

@@ -1,0 +1,3 @@
+timestamp_utc,foundation_type,concrete_volume_m3,pile_diameter_m,pile_length_m,wall_thickness_m,number_of_piles,transition_piece_mass_kg,scour_protection_volume_m3,jacket_height_m,jacket_mass_kg,support_structure_mass_kg,total_foundation_mass_kg
+2026-07-31T09:49:40.765834+00:00,monopile,,10.0,90.0,0.06915589887609914,1,100000.0,1794.7169811320755,,,1463320.391514506,1563320.391514506
+2026-07-31T10:23:54.438104+00:00,monopile,,8.0,65.0,0.06771650176603629,1,100000.0,1148.6792452830189,,,592786.2813425062,692786.2813425062

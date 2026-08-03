@@ -1,0 +1,5 @@
+/home/s2795056/projects/GitHub/WISDEM
+/home/s2795056/miniforge3/envs/wisdem-env/lib/python314.zip
+/home/s2795056/miniforge3/envs/wisdem-env/lib/python3.14
+/home/s2795056/miniforge3/envs/wisdem-env/lib/python3.14/lib-dynload
+/home/s2795056/miniforge3/envs/wisdem-env/lib/python3.14/site-packages

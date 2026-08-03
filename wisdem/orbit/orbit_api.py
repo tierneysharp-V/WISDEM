@@ -11,8 +11,75 @@ import os
 import sys
 from warnings import warn
 
+import numpy as np
 import openmdao.api as om
 from ORBIT import ProjectManager
+
+
+# Typical rock density used when ORBIT reports scour mass but not volume
+_SCOUR_ROCK_DENSITY_T_PER_M3 = 2.65
+
+
+def _safe_float(value, default=np.nan):
+    """Convert ORBIT values to float, returning default on failure."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _lookup_phase_time(phase_times, *keys):
+    """Return the first matching phase duration from an ORBIT phase_times mapping."""
+    if not isinstance(phase_times, dict):
+        return np.nan
+    lowered = {str(k).lower(): v for k, v in phase_times.items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return _safe_float(lowered[key.lower()])
+    return np.nan
+
+
+def _sum_matching_detailed(detailed, keywords):
+    """Sum numeric detailed-output entries whose keys contain any keyword."""
+    if not isinstance(detailed, dict):
+        return np.nan
+    total = 0.0
+    found = False
+    for key, val in detailed.items():
+        key_l = str(key).lower()
+        if any(kw in key_l for kw in keywords):
+            try:
+                total += float(val)
+                found = True
+            except (TypeError, ValueError):
+                continue
+    return total if found else np.nan
+
+
+def _extract_scour_tonnes(project):
+    """Pull scour protection mass from ORBIT design phase if present."""
+    phases = getattr(project, "phases", None)
+    if not isinstance(phases, dict):
+        return np.nan
+    for name, phase in phases.items():
+        if "scour" not in str(name).lower():
+            continue
+        for attr in (
+            "scour_protection_tonnes",
+            "tonnes_per_substructure",
+            "scour_protection_mass",
+        ):
+            if hasattr(phase, attr):
+                return _safe_float(getattr(phase, attr))
+        # Some ORBIT versions stash results on phase.design or similar
+        design = getattr(phase, "design", None)
+        if design is not None:
+            for attr in ("scour_protection_tonnes", "tonnes_per_substructure"):
+                if hasattr(design, attr):
+                    return _safe_float(getattr(design, attr))
+    return np.nan
 
 
 class HiddenPrints:
@@ -534,6 +601,65 @@ class OrbitWisdem(om.ExplicitComponent):
             units="MW",
             desc="Wind plant capacity, in MW.",
         )
+        self.add_output(
+            "foundation_installation_time",
+            np.nan,
+            units="h",
+            desc="ORBIT phase time for monopile or jacket foundation installation.",
+        )
+        self.add_output(
+            "turbine_installation_time",
+            np.nan,
+            units="h",
+            desc="ORBIT phase time for turbine (WTG) installation.",
+        )
+        self.add_output(
+            "pile_driving_time",
+            np.nan,
+            units="h",
+            desc="ORBIT pile-driving duration when available from detailed outputs.",
+        )
+        self.add_output(
+            "grouting_time",
+            np.nan,
+            units="h",
+            desc="ORBIT grouting duration when available from detailed outputs.",
+        )
+        self.add_output(
+            "scour_protection_tonnes",
+            np.nan,
+            units="t",
+            desc="Scour protection mass per substructure from ORBIT design phase.",
+        )
+        self.add_output(
+            "scour_protection_volume",
+            np.nan,
+            units="m**3",
+            desc="Scour protection volume per substructure (from ORBIT or tonnes/density).",
+        )
+        self.add_output(
+            "project_days",
+            np.nan,
+            units="d",
+            desc="ORBIT project duration in days when available.",
+        )
+        self.add_output(
+            "vessel_days",
+            np.nan,
+            units="d",
+            desc="Vessel days derived from installation time or ORBIT project days.",
+        )
+        self.add_output(
+            "weather_delay_time",
+            np.nan,
+            units="h",
+            desc="Total weather delay time when exposed by ORBIT.",
+        )
+        self.add_output(
+            "weather_downtime_factor",
+            np.nan,
+            desc="Weather delay time divided by total installation time when available.",
+        )
         self.add_discrete_output(
             "layout",
             None,
@@ -809,3 +935,56 @@ class OrbitWisdem(om.ExplicitComponent):
             discrete_outputs["layout"] = project.phases["ArraySystemDesign"].create_layout_df()
         elif "CustomArraySystemDesign" in project.phases:
             discrete_outputs["layout"] = project.phases["CustomArraySystemDesign"].create_layout_df()
+
+        # Optional installation metrics (attribute names vary across ORBIT versions)
+        phase_times = getattr(project, "phase_times", None)
+        if phase_times is None:
+            phase_times = getattr(project, "phase_times_hours", {})
+        outputs["foundation_installation_time"] = _lookup_phase_time(
+            phase_times,
+            "MonopileInstallation",
+            "JacketInstallation",
+            "FixedSubstructureInstallation",
+            "SubstructureInstallation",
+        )
+        outputs["turbine_installation_time"] = _lookup_phase_time(
+            phase_times,
+            "TurbineInstallation",
+            "TurbineInstall",
+        )
+
+        detailed = getattr(project, "detailed_outputs", None)
+        if detailed is None:
+            detailed = getattr(project, "logs", {})
+        outputs["pile_driving_time"] = _sum_matching_detailed(
+            detailed, ("drive pile", "pile drive", "pile_drive", "driving")
+        )
+        outputs["grouting_time"] = _sum_matching_detailed(
+            detailed, ("grout",)
+        )
+
+        scour_t = _extract_scour_tonnes(project)
+        outputs["scour_protection_tonnes"] = scour_t
+        if np.isfinite(scour_t) and scour_t >= 0.0:
+            outputs["scour_protection_volume"] = scour_t / _SCOUR_ROCK_DENSITY_T_PER_M3
+        else:
+            outputs["scour_protection_volume"] = np.nan
+
+        project_days = getattr(project, "project_days", None)
+        if project_days is None:
+            install_h = _safe_float(project.installation_time, default=np.nan)
+            project_days = install_h / 24.0 if np.isfinite(install_h) else np.nan
+        outputs["project_days"] = _safe_float(project_days)
+        outputs["vessel_days"] = outputs["project_days"]
+
+        weather_delay = getattr(project, "weather_delay", None)
+        if weather_delay is None:
+            weather_delay = getattr(project, "total_weather_delay", None)
+        if weather_delay is None and isinstance(detailed, dict):
+            weather_delay = _sum_matching_detailed(detailed, ("weather delay", "weather_delay", "weatherdelay"))
+        outputs["weather_delay_time"] = _safe_float(weather_delay)
+        install_h = _safe_float(project.installation_time, default=np.nan)
+        if np.isfinite(outputs["weather_delay_time"]) and np.isfinite(install_h) and install_h > 0.0:
+            outputs["weather_downtime_factor"] = outputs["weather_delay_time"] / install_h
+        else:
+            outputs["weather_downtime_factor"] = np.nan
