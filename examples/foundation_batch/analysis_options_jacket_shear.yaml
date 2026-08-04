@@ -1,0 +1,82 @@
+general:
+        folder_output: outputs
+        fname_output: refturb_output
+design_variables:
+
+    jacket:
+        foot_head_ratio:
+            flag: True
+            lower_bound: 1.1
+            upper_bound: 5.0
+        r_head:
+            flag: True
+            lower_bound: 2.
+            upper_bound: 6.
+        leg_thickness:
+            flag: True
+            # Temporarily widened for shear sensitivity (was 0.05–0.1)
+            lower_bound: 0.005
+            upper_bound: 0.5
+        leg_diameter:
+            flag: True
+            # Temporarily widened for shear sensitivity (was 0.9–5)
+            lower_bound: 0.3
+            upper_bound: 8.
+        brace_diameters:
+            flag: True
+            # Temporarily widened for shear sensitivity (was 0.5–2)
+            lower_bound: 0.2
+            upper_bound: 5.
+        brace_thicknesses:
+            flag: True
+            # Temporarily widened for shear sensitivity (was 0.05–0.5)
+            lower_bound: 0.005
+            upper_bound: 0.5
+        # Height and bay spacing set by conceptual design rules; not DVs
+        height:
+            flag: False
+            lower_bound: 30.
+            upper_bound: 100.
+        bay_spacing:
+            flag: False
+            lower_bound: 0.05
+            upper_bound: 0.95
+
+merit_figure: jacket_mass
+
+constraints:
+    jacket:
+        stress:
+            flag: True
+        global_buckling:
+            flag: False
+        shell_buckling:
+            flag: True
+        # Disabled due to instability (SLSQP linesearch / frequency band)
+        frequency_1:
+            flag: False
+            lower_bound: 0.13
+            upper_bound: 0.20
+        tower_diameter_coupling:
+            flag: True
+        # Freeboard pre-set by conceptual design rules
+        height_airgap:
+            flag: False
+            air_gap: 1.5
+            safety_margin: 4.0
+
+driver:
+    optimization:
+        flag: True            # Flag to enable optimization
+        tol: 1.e-2            # Optimality tolerance
+        max_major_iter: 100    # Maximum number of major design iterations (SNOPT)
+        max_minor_iter: 1000   # Maximum number of minor design iterations (SNOPT)
+        max_iter: 50        # Maximum number of iterations (SLSQP)
+        solver: SLSQP         # Optimization solver. Other options are 'SLSQP' - 'CONMIN'
+        step_size: 1.e-6      # Step size for finite differencing
+        form: forward         # Finite differencing mode, either forward or central
+        debug_print: False
+
+recorder:
+    flag: False                            # Flag to activate OpenMDAO recorder
+    file_name: log_opt.sql    # Name of OpenMDAO recorder

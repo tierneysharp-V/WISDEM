@@ -1,0 +1,116 @@
+general:
+        folder_output: outputs
+        fname_output: refturb_output
+design_variables:
+
+    tower:
+        outer_diameter:
+            flag: False
+            lower_bound: 3.87
+            upper_bound: 8.0
+        layer_thickness:
+            flag: False
+            lower_bound: 4e-3
+            upper_bound: 2e-1
+    monopile:
+        outer_diameter:
+            flag: True
+            uniform: True
+            # Temporarily widened for shear sensitivity (was 3.87–8.0)
+            lower_bound: 0.5
+            upper_bound: 20.0
+        layer_thickness:
+            flag: True
+            uniform: True
+            # Temporarily widened for shear sensitivity (was 0.05–0.2)
+            lower_bound: 0.005
+            upper_bound: 0.5
+        # Height set by conceptual design rules (H_free + 5*D); not a DV
+        height:
+            flag: False
+            lower_bound: 40.0
+            upper_bound: 120.0
+
+merit_figure: monopile_mass
+
+constraints:
+    tower:
+        height_constraint:
+            flag: False
+            lower_bound: 1.e-2
+            upper_bound: 1.e-2
+        stress:
+            flag: True
+        global_buckling:
+            flag: True
+        shell_buckling:
+            flag: True
+        d_to_t:
+            flag: False
+            lower_bound: 120.0
+            upper_bound: 2000.0
+        taper:
+            flag: False
+            lower_bound: 0.2
+        # Tower is not a DV; slope constraint is redundant for this batch
+        slope:
+            flag: False
+        frequency_1:
+            flag: False
+            lower_bound: 0.13
+            upper_bound: 0.40
+    monopile:
+        stress:
+            flag: True
+        global_buckling:
+            flag: True
+        shell_buckling:
+            flag: True
+        d_to_t:
+            flag: True
+            lower_bound: 1.0
+            upper_bound: 150.0
+        taper:
+            flag: False
+            lower_bound: 0.2
+        # Uniform prismatic D/t — slope constraints always satisfied
+        slope:
+            flag: False
+        thickness_slope:
+            flag: False
+        frequency_1:
+            flag: True
+            lower_bound: 0.13
+            upper_bound: 0.20
+        # Embedment set by 5*D rule after sizing; do not fight with a fixed floor
+        pile_depth:
+            flag: False
+            lower_bound: 20.0
+        tower_diameter_coupling:
+            flag: True
+        # Freeboard pre-set by conceptual design rules
+        height_airgap:
+            flag: False
+            air_gap: 1.5
+            safety_margin: 4.0
+
+driver:
+    optimization:
+        flag: True
+        tol: 1.e-4
+        max_major_iter: 1000
+        max_minor_iter: 100
+        max_iter: 100
+        solver: SLSQP
+        # Slightly larger FD step for stabler soil-spring + frequency gradients
+        step_size: 1.e-5
+        form: central
+    design_of_experiments:
+        flag: False
+        run_parallel: True
+        generator: Uniform
+        num_samples: 5
+
+recorder:
+    flag: False
+    file_name: log_opt.sql

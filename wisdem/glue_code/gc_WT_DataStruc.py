@@ -2061,6 +2061,70 @@ class BuildMonopileRefAxis(om.ExplicitComponent):
         outputs["ref_axis"][:, 2] = z_top - height * (1.0 - s)
 
 
+class BroadcastMonopileSection(om.ExplicitComponent):
+    """
+    Optionally broadcast station-0 diameter/thickness to all stations.
+
+    Keeps a multi-station mesh for Frame3DD / soil springs while allowing a
+    prismatic (constant D, t) design space when ``uniform_*`` flags are True.
+    """
+
+    def initialize(self):
+        self.options.declare("n_height")
+        self.options.declare("n_layers")
+        self.options.declare("uniform_diameter", default=False)
+        self.options.declare("uniform_thickness", default=False)
+
+    def setup(self):
+        n_height = self.options["n_height"]
+        n_layers = self.options["n_layers"]
+        # Scalar (or per-layer) design inputs when uniform — avoids OpenMDAO
+        # design-var ``indices`` size mismatches with ScipyOptimizeDriver.
+        if self.options["uniform_diameter"]:
+            self.add_input("diameter_in", val=0.0, units="m")
+        else:
+            self.add_input("diameter_in", val=np.zeros(n_height), units="m")
+        if self.options["uniform_thickness"]:
+            self.add_input("layer_thickness_in", val=np.zeros((n_layers, 1)), units="m")
+        else:
+            self.add_input("layer_thickness_in", val=np.zeros((n_layers, n_height)), units="m")
+        self.add_output("diameter", val=np.zeros(n_height), units="m")
+        self.add_output("layer_thickness", val=np.zeros((n_layers, n_height)), units="m")
+
+        self.declare_partials("diameter", "diameter_in")
+        self.declare_partials("layer_thickness", "layer_thickness_in")
+
+    def compute(self, inputs, outputs):
+        d_in = np.asarray(inputs["diameter_in"], dtype=float).flatten()
+        t_in = np.asarray(inputs["layer_thickness_in"], dtype=float)
+        if self.options["uniform_diameter"]:
+            outputs["diameter"][:] = d_in[0]
+        else:
+            outputs["diameter"][:] = d_in
+        if self.options["uniform_thickness"]:
+            outputs["layer_thickness"][:] = np.asarray(t_in, dtype=float).reshape(-1, 1)
+        else:
+            outputs["layer_thickness"][:] = t_in
+
+    def compute_partials(self, inputs, partials):
+        n_height = self.options["n_height"]
+        n_layers = self.options["n_layers"]
+        if self.options["uniform_diameter"]:
+            partials["diameter", "diameter_in"] = np.ones((n_height, 1))
+        else:
+            partials["diameter", "diameter_in"] = np.eye(n_height)
+
+        n_t = n_layers * n_height
+        if self.options["uniform_thickness"]:
+            jac_t = np.zeros((n_t, n_layers))
+            for i_layer in range(n_layers):
+                row0 = i_layer * n_height
+                jac_t[row0 : row0 + n_height, i_layer] = 1.0
+            partials["layer_thickness", "layer_thickness_in"] = jac_t
+        else:
+            partials["layer_thickness", "layer_thickness_in"] = np.eye(n_t)
+
+
 class Monopile(om.Group):
     def initialize(self):
         self.options.declare("fixedbottomse_options")
@@ -2069,14 +2133,24 @@ class Monopile(om.Group):
         fixedbottomse_options = self.options["fixedbottomse_options"]
         n_height = fixedbottomse_options["n_height"]
         n_layers = fixedbottomse_options["n_layers"]
+        uniform_diameter = bool(fixedbottomse_options.get("uniform_diameter", False))
+        uniform_thickness = bool(fixedbottomse_options.get("uniform_thickness", False))
 
         ivc = self.add_subsystem("monopile_indep_vars", om.IndepVarComp(), promotes=["*"])
-        ivc.add_output(
-            "diameter",
-            val=np.zeros(n_height),
-            units="m",
-            desc="1D array of the outer diameter values defined along the tower axis.",
-        )
+        if uniform_diameter:
+            ivc.add_output(
+                "diameter_in",
+                val=0.0,
+                units="m",
+                desc="Prismatic outer diameter (broadcast to all stations).",
+            )
+        else:
+            ivc.add_output(
+                "diameter_in",
+                val=np.zeros(n_height),
+                units="m",
+                desc="Outer diameter design values along the monopile axis.",
+            )
         ivc.add_discrete_output(
             "layer_name",
             val=n_layers * [""],
@@ -2087,12 +2161,20 @@ class Monopile(om.Group):
             val=n_layers * [""],
             desc="1D array of the names of the materials of each layer modeled in the tower structure.",
         )
-        ivc.add_output(
-            "layer_thickness",
-            val=np.zeros((n_layers, n_height)),
-            units="m",
-            desc="2D array of the thickness of the layers of the tower structure. The first dimension represents each layer, the second dimension represents each piecewise-constant entry of the tower sections.",
-        )
+        if uniform_thickness:
+            ivc.add_output(
+                "layer_thickness_in",
+                val=np.zeros((n_layers, 1)),
+                units="m",
+                desc="Prismatic layer thicknesses (broadcast to all stations).",
+            )
+        else:
+            ivc.add_output(
+                "layer_thickness_in",
+                val=np.zeros((n_layers, n_height)),
+                units="m",
+                desc="Layer thickness design values along the monopile axis.",
+            )
         ivc.add_output(
             "outfitting_factor", val=0.0, desc="Multiplier that accounts for secondary structure mass inside of tower"
         )
@@ -2121,6 +2203,18 @@ class Monopile(om.Group):
             "s_grid",
             val=np.linspace(0.0, 1.0, n_height),
             desc="Nondimensional monopile grid (0 at pile tip, 1 at transition piece).",
+        )
+
+        self.add_subsystem(
+            "section",
+            BroadcastMonopileSection(
+                n_height=n_height,
+                n_layers=n_layers,
+                uniform_diameter=uniform_diameter,
+                uniform_thickness=uniform_thickness,
+            ),
+            promotes_inputs=["diameter_in", "layer_thickness_in"],
+            promotes_outputs=["diameter", "layer_thickness"],
         )
 
         self.add_subsystem(

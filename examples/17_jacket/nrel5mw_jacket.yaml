@@ -43,7 +43,7 @@ components:
         transition_piece_mass: 100000.0
         transition_piece_cost: 100000.0
         n_bays: 4
-        n_legs: 3
+        n_legs: 4
         r_foot: 6.0
         r_head: 3.0
         height: 50.0

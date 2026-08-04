@@ -403,6 +403,10 @@ properties:
                         default: {}
                         properties:
                             flag: *flag
+                            uniform:
+                                type: boolean
+                                default: False
+                                description: If True, optimize only the first station diameter and broadcast it to all stations (prismatic column)
                             lower_bound: &dbound
                                 type: number
                                 minimum: 0.1
@@ -417,6 +421,10 @@ properties:
                         description: Adjust the layer thickness of each section in the column
                         properties:
                             flag: *flag
+                            uniform:
+                                type: boolean
+                                default: False
+                                description: If True, optimize only the first station thickness and broadcast it to all stations (prismatic column)
                             lower_bound: &tbound
                                 type: number
                                 minimum: 1e-5

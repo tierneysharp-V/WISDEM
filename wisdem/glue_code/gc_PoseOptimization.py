@@ -113,7 +113,11 @@ class PoseOptimization(object):
                 wt_opt.driver.options["optimizer"] = opt_options["solver"]
 
                 options_keys = ["tol", "max_iter", "disp"]
-                opt_settings_keys = ["rhobeg", "catol", "adaptive"]
+                # rhobeg/catol/adaptive are COBYLA-only; passing them to SLSQP triggers
+                # "Unknown solver options" warnings and does not affect the solve.
+                opt_settings_keys = (
+                    ["rhobeg", "catol", "adaptive"] if opt_options["solver"] == "COBYLA" else []
+                )
                 mapped_keys = {"max_iter": "maxiter"}
                 wt_opt = self._set_optimizer_properties(wt_opt, options_keys, opt_settings_keys, mapped_keys)
 
@@ -564,16 +568,18 @@ class PoseOptimization(object):
 
         # -- Monopile --
         if monopile_opt["outer_diameter"]["flag"]:
+            # When uniform=True, diameter_in is a scalar IVC (BroadcastMonopileSection expands it)
             wt_opt.model.add_design_var(
-                "monopile.diameter",
+                "monopile.diameter_in",
                 lower=monopile_opt["outer_diameter"]["lower_bound"],
                 upper=monopile_opt["outer_diameter"]["upper_bound"],
                 ref=5.0,
             )
 
         if monopile_opt["layer_thickness"]["flag"]:
+            # When uniform=True, layer_thickness_in has shape (n_layers, 1)
             wt_opt.model.add_design_var(
-                "monopile.layer_thickness",
+                "monopile.layer_thickness_in",
                 lower=monopile_opt["layer_thickness"]["lower_bound"],
                 upper=monopile_opt["layer_thickness"]["upper_bound"],
                 ref=1e-2,

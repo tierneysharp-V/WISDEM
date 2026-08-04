@@ -23,6 +23,7 @@ WISDEM:
             tol: 1e-9
     FixedBottomSE:
         flag: True
+        soil_springs: True
         wind: PowerWind
         gamma_f: 1.35
         gamma_m: 1.3

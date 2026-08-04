@@ -1056,6 +1056,8 @@ def assign_monopile_values(wt_opt, modeling_options, monopile):
     # Function to assign values to the openmdao component Monopile
     n_height = modeling_options["WISDEM"]["FixedBottomSE"]["n_height"]  # Number of points along monopile height
     n_layers = modeling_options["WISDEM"]["FixedBottomSE"]["n_layers"]
+    uniform_diameter = bool(modeling_options["WISDEM"]["FixedBottomSE"].get("uniform_diameter", False))
+    uniform_thickness = bool(modeling_options["WISDEM"]["FixedBottomSE"].get("uniform_thickness", False))
 
     svec = np.unique(
         np.r_[
@@ -1067,10 +1069,14 @@ def assign_monopile_values(wt_opt, modeling_options, monopile):
     )
 
     wt_opt["monopile.s_grid"] = svec
-    wt_opt["monopile.diameter"] = PchipInterpolator(
+    diam_vals = PchipInterpolator(
         monopile["outer_shape"]["outer_diameter"]["grid"],
         monopile["outer_shape"]["outer_diameter"]["values"],
     )(svec)
+    if uniform_diameter:
+        wt_opt["monopile.diameter_in"] = float(diam_vals[0])
+    else:
+        wt_opt["monopile.diameter_in"] = diam_vals
 
     z_vals = PchipInterpolator(
         monopile["reference_axis"]["z"]["grid"],
@@ -1092,7 +1098,10 @@ def assign_monopile_values(wt_opt, modeling_options, monopile):
 
     wt_opt["monopile.layer_name"] = layer_name
     wt_opt["monopile.layer_mat"] = layer_mat
-    wt_opt["monopile.layer_thickness"] = thickness
+    if uniform_thickness:
+        wt_opt["monopile.layer_thickness_in"] = thickness[:, :1]
+    else:
+        wt_opt["monopile.layer_thickness_in"] = thickness
 
     wt_opt["monopile.outfitting_factor"] = monopile["structure"]["outfitting_factor"]
     wt_opt["monopile.transition_piece_mass"] = monopile["transition_piece_mass"]

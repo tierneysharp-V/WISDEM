@@ -683,6 +683,12 @@ class WindTurbineOntologyPython(object):
         ):
             self.analysis_options["opt_flag"] = True
 
+        # Prismatic monopile section flags (analysis → modeling for Monopile Group setup)
+        mono_dv = self.analysis_options["design_variables"].get("monopile", {})
+        fb = self.modeling_options["WISDEM"].setdefault("FixedBottomSE", {})
+        fb["uniform_diameter"] = bool(mono_dv.get("outer_diameter", {}).get("uniform", False))
+        fb["uniform_thickness"] = bool(mono_dv.get("layer_thickness", {}).get("uniform", False))
+
         # Blade design variables
         # If not an optimization DV, then the number of points should be same as the discretization
         blade_opt_options = self.analysis_options["design_variables"]["blade"]

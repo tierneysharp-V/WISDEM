@@ -29,6 +29,8 @@ FOUNDATION_CSV_COLUMNS = [
     "jacket_mass_kg",
     "support_structure_mass_kg",
     "total_foundation_mass_kg",
+    "opt_exit_mode",
+    "f1_Hz",
 ]
 
 _EXAMPLES_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -84,7 +86,7 @@ def csv_path_for_foundation_type(ftype):
     raise ValueError(f"Unknown foundation type '{ftype}'; expected jacket or monopile")
 
 
-def collect_foundation_row(wt_opt, modeling_options):
+def collect_foundation_row(wt_opt, modeling_options, extras=None):
     """Build one results dict matching FOUNDATION_CSV_COLUMNS."""
     ftype = _detect_foundation_type(modeling_options)
     row = {col: np.nan for col in FOUNDATION_CSV_COLUMNS}
@@ -114,6 +116,7 @@ def collect_foundation_row(wt_opt, modeling_options):
         row["pile_diameter_m"] = np.nan
         row["pile_length_m"] = np.nan
         row["wall_thickness_m"] = np.nan
+        row["f1_Hz"] = _get_val(wt_opt, "fixedse.structural_frequencies", reduce="first")
 
     elif ftype == "monopile":
         mono_mass = _get_val(wt_opt, "fixedse.monopile_mass", units="kg")
@@ -135,21 +138,29 @@ def collect_foundation_row(wt_opt, modeling_options):
         row["number_of_piles"] = 1
         row["jacket_height_m"] = np.nan
         row["jacket_mass_kg"] = np.nan
+        row["f1_Hz"] = _get_val(wt_opt, "fixedse.structural_frequencies", reduce="first")
 
     if bos_on:
         row["scour_protection_volume_m3"] = _get_val(
             wt_opt, "orbit.scour_protection_volume", units="m**3"
         )
 
+    if extras:
+        for key, val in extras.items():
+            if key in FOUNDATION_CSV_COLUMNS:
+                row[key] = val
+
     return row
 
 
-def append_foundation_results(wt_opt, modeling_options, csv_path=None):
+def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=None):
     """
     Append one foundation-results row.
 
     If csv_path is None, routes automatically to jacket_foundation_results.csv or
     monopile_foundation_results.csv based on modeling flags.
+
+    extras : optional dict of extra column values (e.g. opt_exit_mode).
 
     Returns
     -------
@@ -160,10 +171,27 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None):
     if csv_path is None:
         csv_path = csv_path_for_foundation_type(ftype)
 
-    row = collect_foundation_row(wt_opt, modeling_options)
+    row = collect_foundation_row(wt_opt, modeling_options, extras=extras)
 
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
-    write_header = not os.path.isfile(csv_path) or os.path.getsize(csv_path) == 0
+
+    # Migrate older CSVs that predate opt_exit_mode / f1_Hz columns
+    if os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0:
+        with open(csv_path, newline="", encoding="utf-8") as rf:
+            reader = csv.DictReader(rf)
+            header = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+        if header and header != FOUNDATION_CSV_COLUMNS:
+            with open(csv_path, "w", newline="", encoding="utf-8") as wf:
+                writer = csv.DictWriter(wf, fieldnames=FOUNDATION_CSV_COLUMNS, extrasaction="ignore")
+                writer.writeheader()
+                for erow in existing_rows:
+                    writer.writerow({c: erow.get(c, "") for c in FOUNDATION_CSV_COLUMNS})
+            write_header = False
+        else:
+            write_header = False
+    else:
+        write_header = True
 
     out = {}
     for col in FOUNDATION_CSV_COLUMNS:
@@ -178,7 +206,7 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None):
             out[col] = val
 
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FOUNDATION_CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=FOUNDATION_CSV_COLUMNS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(out)
