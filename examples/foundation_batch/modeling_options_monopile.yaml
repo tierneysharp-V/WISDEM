@@ -1,4 +1,5 @@
 # Loading-driven monopile baseline for foundation batch sensitivity runs
+# Runtime: run_foundation_batch sets n_dlc=2 (rated GustETM + parked extreme at V50)
 General:
     verbosity: False
 WISDEM:
@@ -37,7 +38,8 @@ WISDEM:
             geom: True
             tol: 1e-9
     BOS:
-        flag: True
+        # Off for foundation sizing: large D/scour trips ORBIT VesselCapacityError
+        flag: False
         plant_turbine_spacing: 7
         plant_row_spacing: 7
         commissioning_cost_kW: 44.0

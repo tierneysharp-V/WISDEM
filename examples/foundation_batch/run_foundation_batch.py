@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-Run WISDEM foundation scenarios from any CSV with the expected column names.
+Run WISDEM foundation scenarios from a site CSV + turbine lookup CSV.
 
 Usage:
-  python run_foundation_batch.py /path/to/scenarios.csv --foundation jacket
-  python run_foundation_batch.py /path/to/scenarios.csv --foundation monopile
-  python run_foundation_batch.py /path/to/scenarios.csv --foundation both
+  python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation jacket
+  python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation monopile
+  python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation both
 
-Each CSV row is one scenario. Extra columns are ignored. Blank cells keep the
-baseline modeling-options value. Foundation type is selected via --foundation,
-not from the CSV.
+Site CSV columns (required):
+  turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m
 
-Conceptual design workflow (before optimisation):
-  1. Read site params (water depth, Hs, Tp) and tower-base loads
-  2. Set freeboard height H_free = WD + Hs + air_gap + safety_margin
-  3. Jacket: assign n_bays from H_free, equal bay_spacing, n_legs=4
-  4. Monopile: provisional embedment = 5 * D_initial; total length = H_free + L_emb
-  5. Monopile two-stage opt: Stage 1 (full constraints, shorter) then Stage 2 polish
-  6. Monopile post-pass: L_emb = 5 * D_opt, refresh analysis (run_only)
-  7. Soil sweeps: warm-start D/t from previous feasible row when only G changes
+Turbine lookup CSV:
+  First column = parameter (YAML path or special key). Remaining columns = turbines.
+  Special row `_source_yaml` may point at a full geometry YAML; other rows override.
+  Rating lookup uses `assembly.rated_power` (or `turbine_rating_W`).
+
+Workflow per scenario:
+  1. Look up turbine by rating and build a temporary full geometry YAML
+  2. Stage 1: RotorSE+DriveSE compute RNA loads (V_mean = V50/7)
+  3. Stage 2: Loading-driven monopile/jacket sizing with n_dlc=2
+     - DLC1: rated GustETM RNA + rated_V
+     - DLC2: parked extreme RNA (feathered-disk drag) + Uref=V50
+  4. Frequency bounds from min/max rpm (soft-stiff; rated soft-stiff if band breached)
+  5. Monopile/jacket: tower-scaled cold start -> preflight repair ->
+     two-stage SLSQP; soil-only warm-start when a prior case matches
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import copy
 import csv
 import importlib
 import importlib.util
+import math
 import os
 import sys
 import traceback
@@ -46,23 +52,19 @@ JACKET_DIR = os.path.join(EXAMPLES_DIR, "17_jacket")
 TMP_DIR = os.path.join(BATCH_DIR, "tmp")
 
 REQUIRED_COLUMNS = [
-    "water_depth_m",
+    "turbine_rating_W",
+    "V50_mps",
     "Hs50_m",
-    "Tp50_s",
     "soil_shear_modulus_Pa",
-    "tower_base_shear_N",
-    "tower_base_vertical_N",
-    "tower_base_overturning_moment_Nm",
+    "water_depth_m",
 ]
 
 # Scenario fields that must match for soil-only warm start (everything except G)
 _WARMSTART_MATCH_COLS = [
-    "water_depth_m",
+    "turbine_rating_W",
+    "V50_mps",
     "Hs50_m",
-    "Tp50_s",
-    "tower_base_shear_N",
-    "tower_base_vertical_N",
-    "tower_base_overturning_moment_Nm",
+    "water_depth_m",
 ]
 
 BASELINES = {
@@ -78,12 +80,18 @@ BASELINES = {
     },
 }
 
+MODELING_ROTORSE = os.path.join(BATCH_DIR, "modeling_options_rotorse.yaml")
+ANALYSIS_LOADS = os.path.join(BATCH_DIR, "analysis_options_loads.yaml")
+DEFAULT_TURBINE_CSV = os.path.join(BATCH_DIR, "turbine_lookup.csv")
+
 STAGE1_MAX_ITER = 50
-# Reject soil warm-starts that are strength-infeasible (util > this)
 _WARMSTART_MAX_UTIL = 1.05
-# Match analysis_options_monopile.yaml soft-stiff frequency_1 band
-_FREQ_LO = 0.22
-_FREQ_HI = 0.35
+_RATING_MATCH_RTOL = 1e-6
+_RATING_MATCH_ATOL = 1.0  # Watts
+
+# Early-design parked rotor: feathered blades as a low-Cd disk (not IEC DLC 6.x)
+PARKED_ROTOR_CD = 0.04
+_G = 9.80665
 
 
 def _load_repo_module(qualname: str, relpath: str):
@@ -101,7 +109,6 @@ def _load_repo_module(qualname: str, relpath: str):
 def _setup_wisdem():
     from wisdem import run_wisdem as _run_wisdem_installed  # noqa: F401
 
-    # Prefer this checkout for modules changed on the branch (installed wheel may lag).
     val = _load_repo_module("wisdem.inputs.validation", os.path.join("wisdem", "inputs", "validation.py"))
     if val is not None:
         import wisdem.inputs as inputs_pkg
@@ -152,8 +159,75 @@ def _to_float(value: Any) -> float:
     return float(str(value).strip().replace(",", ""))
 
 
+def _parse_cell(value: Any) -> Any:
+    """Parse a turbine-CSV cell as YAML (supports scalars, lists, dicts)."""
+    if _is_blank(value):
+        return None
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    try:
+        return yaml.safe_load(text)
+    except Exception:
+        return text
+
+
+def _set_by_path(root: dict, path: str, value: Any) -> None:
+    """Set a nested dict/list value using dotted YAML-path keys (numeric list indices OK)."""
+    keys = [k for k in path.split(".") if k]
+    if not keys:
+        raise ValueError("Empty parameter path")
+    cur: Any = root
+    for key in keys[:-1]:
+        if key.isdigit():
+            idx = int(key)
+            if not isinstance(cur, list):
+                raise TypeError(f"Cannot index non-list at '{key}' in path '{path}'")
+            while len(cur) <= idx:
+                cur.append({})
+            if cur[idx] is None:
+                cur[idx] = {}
+            cur = cur[idx]
+        else:
+            if not isinstance(cur, dict):
+                raise TypeError(f"Cannot descend into non-dict at '{key}' in path '{path}'")
+            nxt = cur.get(key)
+            if nxt is None:
+                cur[key] = {}
+                nxt = cur[key]
+            cur = nxt
+    last = keys[-1]
+    if last.isdigit():
+        idx = int(last)
+        if not isinstance(cur, list):
+            raise TypeError(f"Cannot assign into non-list at end of '{path}'")
+        while len(cur) <= idx:
+            cur.append(None)
+        cur[idx] = value
+    else:
+        if not isinstance(cur, dict):
+            raise TypeError(f"Cannot assign into non-dict at end of '{path}'")
+        cur[last] = value
+
+
+def _get_by_path(root: Any, path: str, default=None):
+    cur = root
+    for key in path.split("."):
+        if cur is None:
+            return default
+        if key.isdigit():
+            if not isinstance(cur, list) or int(key) >= len(cur):
+                return default
+            cur = cur[int(key)]
+        else:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+    return cur
+
+
 def read_scenarios(csv_path: str) -> list[dict[str, Any]]:
-    """Read any CSV; require expected column names; ignore extras."""
+    """Read site CSV; require expected column names; ignore extras."""
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"Input CSV not found: {csv_path}")
 
@@ -172,7 +246,7 @@ def read_scenarios(csv_path: str) -> list[dict[str, Any]]:
             )
 
         rows = []
-        for i, raw in enumerate(reader, start=2):  # 1-indexed data rows (header=1)
+        for i, raw in enumerate(reader, start=2):
             row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in raw.items() if k}
             if all(_is_blank(row.get(c, "")) for c in REQUIRED_COLUMNS):
                 continue
@@ -182,6 +256,340 @@ def read_scenarios(csv_path: str) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError(f"No scenario rows found in {csv_path}")
     return rows
+
+
+def load_turbine_lookup(csv_path: str) -> dict[str, dict[str, Any]]:
+    """
+    Load transposed turbine CSV.
+
+    Returns {turbine_column_name: {parameter: parsed_value, ...}, ...}
+    """
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"Turbine lookup CSV not found: {csv_path}")
+
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Turbine CSV has no header row: {csv_path}")
+
+        headers = [h.strip() for h in reader.fieldnames if h and h.strip()]
+        if not headers:
+            raise ValueError(f"Turbine CSV has no columns: {csv_path}")
+
+        param_key = headers[0]
+        turbine_cols = headers[1:]
+        if not turbine_cols:
+            raise ValueError("Turbine CSV needs at least one turbine column after the parameter column")
+
+        turbines: dict[str, dict[str, Any]] = {c: {} for c in turbine_cols}
+        for raw in reader:
+            param = (raw.get(param_key) or "").strip()
+            if not param or param.startswith("#"):
+                continue
+            for col in turbine_cols:
+                if col not in raw:
+                    continue
+                parsed = _parse_cell(raw[col])
+                if parsed is not None:
+                    turbines[col][param] = parsed
+
+    return turbines
+
+
+def _resolve_source_yaml(path_value: Any, turbine_csv_path: str) -> str:
+    path = str(path_value).strip()
+    if os.path.isabs(path) and os.path.isfile(path):
+        return path
+    candidates = [
+        os.path.normpath(os.path.join(os.path.dirname(turbine_csv_path), path)),
+        os.path.normpath(os.path.join(BATCH_DIR, path)),
+        os.path.normpath(os.path.join(EXAMPLES_DIR, path)),
+        os.path.normpath(os.path.join(REPO_ROOT, path)),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    raise FileNotFoundError(
+        f"_source_yaml not found: {path_value}\nTried: " + ", ".join(candidates)
+    )
+
+
+def build_turbine_geometry(
+    turbine_params: dict[str, Any],
+    turbine_csv_path: str,
+    foundation_type: str,
+    foundation_baseline_wt: dict,
+) -> dict:
+    """
+    Build a full geometry YAML from turbine lookup params + foundation baseline block.
+    """
+    wt: dict[str, Any] = {}
+    source = turbine_params.get("_source_yaml")
+    if source is not None:
+        src_path = _resolve_source_yaml(source, turbine_csv_path)
+        wt = load_yaml(src_path)
+
+    for key, value in turbine_params.items():
+        if key.startswith("_"):
+            continue
+        _set_by_path(wt, key, value)
+
+    if "components" not in wt:
+        raise ValueError("Turbine geometry missing 'components' (provide _source_yaml or full rows)")
+
+    # Attach / replace foundation component from foundation baseline
+    foundation_comp = copy.deepcopy(
+        foundation_baseline_wt.get("components", {}).get(foundation_type)
+    )
+    if foundation_comp is None:
+        raise ValueError(f"Foundation baseline missing components.{foundation_type}")
+    # Remove the other foundation type if present
+    other = "jacket" if foundation_type == "monopile" else "monopile"
+    wt["components"].pop(other, None)
+    wt["components"][foundation_type] = foundation_comp
+
+    # Ensure materials include steel from foundation baseline if missing
+    if "materials" not in wt and "materials" in foundation_baseline_wt:
+        wt["materials"] = copy.deepcopy(foundation_baseline_wt["materials"])
+
+    return wt
+
+
+def slim_sizing_geometry(full_wt: dict, foundation_type: str) -> dict:
+    """Tower+foundation-only geometry for Loading-driven sizing (RotorSE off)."""
+    comps = full_wt.get("components", {})
+    if "tower" not in comps or foundation_type not in comps:
+        raise ValueError(f"Full geometry missing tower or {foundation_type} for sizing stage")
+    slim = {
+        "windIO_version": full_wt.get("windIO_version", "2.0"),
+        "name": full_wt.get("name", "foundation_sizing"),
+        "assembly": copy.deepcopy(full_wt.get("assembly", {})),
+        "components": {
+            "tower": copy.deepcopy(comps["tower"]),
+            foundation_type: copy.deepcopy(comps[foundation_type]),
+        },
+        "materials": copy.deepcopy(full_wt.get("materials", [])),
+        "control": copy.deepcopy(full_wt.get("control", {})),
+    }
+    return slim
+
+
+def lookup_turbine_column(
+    turbines: dict[str, dict[str, Any]],
+    rating_w: float,
+    turbine_csv_path: str,
+) -> tuple[str, dict[str, Any]]:
+    """Find turbine column whose rating matches rating_w."""
+    matches = []
+    for name, params in turbines.items():
+        rating = params.get("assembly.rated_power", params.get("turbine_rating_W"))
+        if rating is None and "_source_yaml" in params:
+            # Peek source YAML for rating
+            try:
+                src = load_yaml(_resolve_source_yaml(params["_source_yaml"], turbine_csv_path))
+                rating = _get_by_path(src, "assembly.rated_power")
+            except Exception:
+                rating = None
+        if rating is None:
+            continue
+        if math.isclose(float(rating), float(rating_w), rel_tol=_RATING_MATCH_RTOL, abs_tol=_RATING_MATCH_ATOL):
+            matches.append((name, params))
+
+    if not matches:
+        available = []
+        for name, params in turbines.items():
+            r = params.get("assembly.rated_power", params.get("turbine_rating_W", "?"))
+            available.append(f"{name}={r}")
+        raise ValueError(
+            f"No turbine in lookup matches turbine_rating_W={rating_w}. "
+            f"Known: {', '.join(available)}"
+        )
+    if len(matches) > 1:
+        names = ", ".join(m[0] for m in matches)
+        raise ValueError(f"Multiple turbines match rating {rating_w}: {names}")
+    return matches[0]
+
+
+def _rotor_speed_limits_rpm(wt_geom: dict) -> tuple[float, float, float, str]:
+    """
+    Operating rotor-speed limits [rpm] from control, else constant-TSR cut-in/out.
+
+    Returns (min_rpm, max_rpm, rated_rpm, source_label).
+    rated_rpm falls back to the mid of [min, max] if not provided.
+    """
+    control = wt_geom.get("control", {}) or {}
+    assembly = wt_geom.get("assembly", {}) or {}
+
+    min_rpm = control.get("min_rotor_speed")
+    max_rpm = control.get("max_rotor_speed")
+    rated_rpm = control.get("rated_rotor_speed")
+    if min_rpm is not None and max_rpm is not None and not _is_blank(min_rpm) and not _is_blank(max_rpm):
+        mn, mx = float(min_rpm), float(max_rpm)
+        if rated_rpm is not None and not _is_blank(rated_rpm):
+            rd = float(rated_rpm)
+        else:
+            rd = 0.5 * (mn + mx)
+        return mn, mx, rd, "min/max_rotor_speed"
+
+    tsr = control.get("optimal_tsr")
+    v_in = assembly.get("cut_in_wind_speed")
+    v_out = assembly.get("cut_out_wind_speed")
+    diameter = assembly.get("rotor_diameter")
+    missing = [
+        n
+        for n, v in (
+            ("control.optimal_tsr", tsr),
+            ("assembly.cut_in_wind_speed", v_in),
+            ("assembly.cut_out_wind_speed", v_out),
+            ("assembly.rotor_diameter", diameter),
+        )
+        if v is None or _is_blank(v)
+    ]
+    if missing:
+        raise ValueError(
+            "Cannot compute frequency bounds: missing min/max_rotor_speed and also "
+            + ", ".join(missing)
+        )
+    # Ω [rpm] = TSR * V * 60 / (π D) under constant-TSR
+    mn = float(tsr) * float(v_in) * 60.0 / (math.pi * float(diameter))
+    mx = float(tsr) * float(v_out) * 60.0 / (math.pi * float(diameter))
+    if rated_rpm is not None and not _is_blank(rated_rpm):
+        rd = float(rated_rpm)
+    else:
+        rd = 0.5 * (mn + mx)
+    return mn, mx, rd, "TSR/cut-in/cut-out"
+
+
+def rotor_excitation_bands_hz(min_rpm: float, max_rpm: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    1P and 3P excitation bands [Hz] over the rotor-speed operating range.
+
+    1P = [min_rpm/60, max_rpm/60]
+    3P = [3*min_rpm/60, 3*max_rpm/60]
+    """
+    f1p = (float(min_rpm) / 60.0, float(max_rpm) / 60.0)
+    f3p = (3.0 * float(min_rpm) / 60.0, 3.0 * float(max_rpm) / 60.0)
+    return f1p, f3p
+
+
+def classical_soft_stiff_bounds_hz(
+    f1p: tuple[float, float], f3p: tuple[float, float]
+) -> tuple[float, float]:
+    """
+    Classical soft-stiff window: above all 1P and below all 3P.
+
+    lower = max(1P) = f1p[1]
+    upper = min(3P) = f3p[0]
+    Valid only when lower <= upper (rotor speed ratio max/min <= 3).
+    """
+    return float(f1p[1]), float(f3p[0])
+
+
+def rated_soft_stiff_bounds_hz(rated_rpm: float) -> tuple[float, float]:
+    """
+    Soft-stiff band referenced to rated rotor speed only:
+    [Ω_rated/60, 3·Ω_rated/60] = above 1P_rated and below 3P_rated.
+    """
+    f1p_r = float(rated_rpm) / 60.0
+    return f1p_r, 3.0 * f1p_r
+
+
+def maximin_clearance_frequency_hz(
+    f1p: tuple[float, float], f3p: tuple[float, float]
+) -> tuple[float, float]:
+    """
+    Frequency that maximises the minimum signed clearance to the 1P/3P bands
+    that define the classical soft-stiff gap.
+
+    Let a = max(1P), b = min(3P). For a candidate f, signed clearances are
+        c_1P = f - a   (positive when above the 1P band)
+        c_3P = b - f   (positive when below the 3P band)
+    Maximise min(c_1P, c_3P). The optimum is the midpoint
+        f* = (a + b) / 2
+    with half-gap δ = (b - a) / 2  (δ > 0 ⇒ valid soft-stiff gap;
+    δ < 0 ⇒ overlap / breach, f* still minimises the worst intrusion).
+
+    Returns (f_star_hz, signed_half_gap_hz).
+    """
+    a = float(f1p[1])  # max 1P
+    b = float(f3p[0])  # min 3P
+    f_star = 0.5 * (a + b)
+    half_gap = 0.5 * (b - a)
+    return f_star, half_gap
+
+
+def compute_frequency_bounds(wt_geom: dict) -> tuple[float, float]:
+    """
+    Soft-stiff f1 bounds from turbine control/assembly.
+
+    Prefer min/max rotor rpm; else constant-TSR cut-in/out speeds.
+
+    If a classical soft-stiff band exists (max 1P <= min 3P), return that band.
+    If the band is breached (1P/3P ranges overlap), fall back to rated soft-stiff
+    [Ω_rated/60, 3·Ω_rated/60].
+    """
+    min_rpm, max_rpm, rated_rpm, source = _rotor_speed_limits_rpm(wt_geom)
+    if not (math.isfinite(min_rpm) and math.isfinite(max_rpm)) or min_rpm <= 0.0 or max_rpm <= 0.0:
+        raise ValueError(f"Non-finite or non-positive rotor speeds: min={min_rpm}, max={max_rpm}")
+    if min_rpm > max_rpm:
+        raise ValueError(f"Invalid rotor speed limits: min_rpm={min_rpm} > max_rpm={max_rpm}")
+    if not math.isfinite(rated_rpm) or rated_rpm <= 0.0:
+        raise ValueError(f"Non-finite or non-positive rated rotor speed: {rated_rpm}")
+
+    f1p, f3p = rotor_excitation_bands_hz(min_rpm, max_rpm)
+    f_lo, f_hi = classical_soft_stiff_bounds_hz(f1p, f3p)
+
+    if not (math.isfinite(f_lo) and math.isfinite(f_hi)):
+        raise ValueError(f"Non-finite frequency bounds: lo={f_lo}, hi={f_hi}")
+
+    if f_lo <= f_hi:
+        print(f"  Frequency bounds ({source}): [{f_lo:.5f}, {f_hi:.5f}] Hz")
+        print(
+            f"    1P=[{f1p[0]:.5f}, {f1p[1]:.5f}] Hz  "
+            f"3P=[{f3p[0]:.5f}, {f3p[1]:.5f}] Hz"
+        )
+        return f_lo, f_hi
+
+    # Classical soft-stiff window empty: use rated soft-stiff instead.
+    f_lo_r, f_hi_r = rated_soft_stiff_bounds_hz(rated_rpm)
+    f_star, half_gap = maximin_clearance_frequency_hz(f1p, f3p)
+    print(
+        "  WARNING: soft-stiff frequency breach; "
+        "using rated soft-stiff [Ω_rated/60, 3·Ω_rated/60]"
+    )
+    print(
+        f"  Frequency bounds ({source}, rated soft-stiff): [{f_lo_r:.5f}, {f_hi_r:.5f}] Hz  "
+        f"(rated_rpm={rated_rpm:.4f})"
+    )
+    print(
+        f"    1P=[{f1p[0]:.5f}, {f1p[1]:.5f}] Hz  "
+        f"3P=[{f3p[0]:.5f}, {f3p[1]:.5f}] Hz  "
+        f"classical would-be=[{f_lo:.5f}, {f_hi:.5f}] Hz  "
+        f"maximin f*={f_star:.5f} Hz (half-gap={half_gap:.5f} Hz)"
+    )
+    if f_lo_r >= f_hi_r:
+        raise ValueError(
+            f"Rated soft-stiff bounds invalid: lower={f_lo_r:.6g} >= upper={f_hi_r:.6g}"
+        )
+    return f_lo_r, f_hi_r
+
+
+def patch_frequency_bounds(
+    analysis: dict, f_lo: float, f_hi: float, foundation_type: str = "monopile"
+) -> dict:
+    opts = copy.deepcopy(analysis)
+    freq = (
+        opts.setdefault("constraints", {})
+        .setdefault(foundation_type, {})
+        .setdefault("frequency_1", {})
+    )
+    # Monopile sizing always uses soft-stiff. Jackets only patch bounds when already enabled.
+    if foundation_type == "monopile" or freq.get("flag", False):
+        freq["flag"] = True
+        freq["lower_bound"] = float(f_lo)
+        freq["upper_bound"] = float(f_hi)
+    return opts
+
 
 
 def load_yaml(path: str) -> dict:
@@ -195,50 +603,120 @@ def dump_yaml(data: dict, path: str) -> None:
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
 
-def patch_modeling_options(baseline: dict, scenario: dict) -> dict:
-    """Copy baseline modeling options and apply non-blank scenario fields."""
+def patch_environment(baseline: dict, scenario: dict, for_rotorse: bool = False) -> dict:
+    """Copy modeling options and apply site environment fields."""
     opts = copy.deepcopy(baseline)
     env = opts.setdefault("Environment", {})
-    wisdem = opts.setdefault("WISDEM", {})
-    loading = wisdem.setdefault("Loading", {})
-    loads = loading.setdefault("loads", [])
-    if not loads:
-        loads.append({"force": [0.0, 0.0, 0.0], "moment": [0.0, 0.0, 0.0], "velocity": 0.0})
-        loading["loads"] = loads
-
-    load0 = loads[0]
-    force = list(load0.get("force", [0.0, 0.0, 0.0]))
-    moment = list(load0.get("moment", [0.0, 0.0, 0.0]))
-    while len(force) < 3:
-        force.append(0.0)
-    while len(moment) < 3:
-        moment.append(0.0)
 
     mapping_env = {
         "water_depth_m": "water_depth",
         "Hs50_m": "significant_wave_height",
-        "Tp50_s": "significant_wave_period",
         "soil_shear_modulus_Pa": "soil_shear_modulus",
     }
     for csv_col, yaml_key in mapping_env.items():
         if not _is_blank(scenario.get(csv_col)):
             env[yaml_key] = _to_float(scenario[csv_col])
 
-    if not _is_blank(scenario.get("tower_base_shear_N")):
-        force[0] = _to_float(scenario["tower_base_shear_N"])
-    if not _is_blank(scenario.get("tower_base_vertical_N")):
-        force[2] = _to_float(scenario["tower_base_vertical_N"])
-    if not _is_blank(scenario.get("tower_base_overturning_moment_Nm")):
-        moment[0] = _to_float(scenario["tower_base_overturning_moment_Nm"])
+    # IEC: V_extreme50 = 1.4*Vref, V_mean = 0.2*Vref => V_mean = V50/7
+    if for_rotorse and not _is_blank(scenario.get("V50_mps")):
+        env["V_mean"] = _to_float(scenario["V50_mps"]) / 7.0
 
-    load0["force"] = force
-    load0["moment"] = moment
-    loads[0] = load0
-    loading["loads"] = loads
-    wisdem["Loading"] = loading
-    opts["WISDEM"] = wisdem
     opts["Environment"] = env
     return opts
+
+
+def estimate_parked_extreme_loads(
+    loads: dict,
+    scenario: dict,
+    wt_geom: dict,
+    rho_air: float = 1.225,
+) -> dict:
+    """
+    Physics-light parked extreme RNA loads at V50 (early-design screening).
+
+    Fx = 0.5 * rho * Cd * A * V50^2 with Cd=PARKED_ROTOR_CD (feathered disk).
+    Fz = -mass * g; tower-top moments from r_cm × F; Uref = V50.
+    """
+    if _is_blank(scenario.get("V50_mps")):
+        raise ValueError("V50_mps is required for parked extreme Loading case")
+    v50 = _to_float(scenario["V50_mps"])
+    if v50 <= 0.0:
+        raise ValueError(f"V50_mps must be positive, got {v50}")
+
+    diameter = (wt_geom.get("assembly") or {}).get("rotor_diameter")
+    if diameter is None or _is_blank(diameter):
+        raise ValueError("assembly.rotor_diameter required for parked extreme load estimate")
+    d_rotor = float(diameter)
+    if d_rotor <= 0.0:
+        raise ValueError(f"rotor_diameter must be positive, got {d_rotor}")
+
+    area = math.pi * (0.5 * d_rotor) ** 2
+    mass = float(loads["mass"])
+    cm = [float(x) for x in loads["center_of_mass"][:3]]
+    while len(cm) < 3:
+        cm.append(0.0)
+
+    fx = 0.5 * float(rho_air) * PARKED_ROTOR_CD * area * v50**2
+    fy = 0.0
+    fz = -mass * _G
+    rx, ry, rz = cm[0], cm[1], cm[2]
+    # M = r_cm × F at tower top
+    mx = ry * fz - rz * fy
+    my = rz * fx - rx * fz
+    mz = rx * fy - ry * fx
+
+    return {
+        "force": [float(fx), float(fy), float(fz)],
+        "moment": [float(mx), float(my), float(mz)],
+        "velocity": float(v50),
+        "rotor_diameter_m": d_rotor,
+        "disk_area_m2": float(area),
+        "Cd": float(PARKED_ROTOR_CD),
+    }
+
+
+def inject_loading(
+    baseline: dict, scenario: dict, loads: dict, wt_geom: dict
+) -> tuple[dict, dict]:
+    """Loading-driven modeling options: rated GustETM + parked extreme (n_dlc=2)."""
+    opts = patch_environment(baseline, scenario, for_rotorse=False)
+    wisdem = opts.setdefault("WISDEM", {})
+    wisdem["n_dlc"] = 2
+    wisdem.setdefault("RotorSE", {})["flag"] = False
+    wisdem.setdefault("DriveSE", {})["flag"] = False
+    wisdem.setdefault("TowerSE", {})["flag"] = True
+    wisdem.setdefault("FixedBottomSE", {})["flag"] = True
+
+    loading = wisdem.setdefault("Loading", {})
+    loading["mass"] = float(loads["mass"])
+    loading["center_of_mass"] = [float(x) for x in loads["center_of_mass"]]
+    loading["moment_of_inertia"] = [float(x) for x in loads["moment_of_inertia"]]
+
+    force = [float(x) for x in loads["force"]]
+    moment = [float(x) for x in loads["moment"]]
+    while len(force) < 3:
+        force.append(0.0)
+    while len(moment) < 3:
+        moment.append(0.0)
+
+    rho_air = float(opts.get("Environment", {}).get("air_density", 1.225))
+    extreme = estimate_parked_extreme_loads(loads, scenario, wt_geom, rho_air=rho_air)
+
+    loading["loads"] = [
+        {
+            "force": force[:3],
+            "moment": moment[:3],
+            "velocity": float(loads["velocity"]),
+        },
+        {
+            "force": extreme["force"],
+            "moment": extreme["moment"],
+            "velocity": extreme["velocity"],
+        },
+    ]
+    wisdem["Loading"] = loading
+    opts["WISDEM"] = wisdem
+    return opts, extreme
 
 
 def patch_geometry(baseline_wt: dict, modeling: dict, foundation_type: str, cdr, embedment=None) -> dict:
@@ -254,7 +732,7 @@ def _as_float_list(val) -> list[float]:
 
 
 def _scenario_key_for_warmstart(scenario: dict) -> tuple:
-    """Hashable key of site/load fields (excludes soil G)."""
+    """Hashable key of site/turbine fields (excludes soil G)."""
     parts = []
     for col in _WARMSTART_MATCH_COLS:
         v = scenario.get(col, "")
@@ -265,15 +743,201 @@ def _scenario_key_for_warmstart(scenario: dict) -> tuple:
     return tuple(parts)
 
 
+def tower_base_diameter_from_geom(wt_geom: dict) -> float:
+    """Tower base outer diameter from geometry YAML (first station)."""
+    vals = (
+        wt_geom.get("components", {})
+        .get("tower", {})
+        .get("outer_shape", {})
+        .get("outer_diameter", {})
+        .get("values", [])
+    )
+    arr = np.atleast_1d(np.asarray(vals, dtype=float).flatten())
+    if arr.size == 0 or not np.isfinite(arr[0]):
+        raise ValueError("Cannot read tower base diameter from geometry")
+    return float(arr[0])
+
+
+def monopile_diameter_floor(wt_geom: dict) -> float:
+    """Strict D floor: max(YAML DV lower bound, tower base) for diameter coupling."""
+    return float(max(_D_LO, tower_base_diameter_from_geom(wt_geom)))
+
+
 def seed_monopile_diameter_thickness(wt_geom: dict, diameter: float, thickness: float) -> dict:
-    """Overwrite monopile outer diameter and wall thickness (uniform)."""
+    """Overwrite monopile outer diameter and wall thickness (uniform). Enforces D >= tower base."""
     wt = copy.deepcopy(wt_geom)
+    d_floor = monopile_diameter_floor(wt)
+    d = _clip(max(float(diameter), d_floor), _D_LO, _D_HI)
+    t = _clip(float(thickness), _T_LO, _T_HI)
     mono = wt["components"]["monopile"]
     n_d = len(mono["outer_shape"]["outer_diameter"]["values"])
-    mono["outer_shape"]["outer_diameter"]["values"] = [float(diameter)] * n_d
+    mono["outer_shape"]["outer_diameter"]["values"] = [d] * n_d
     n_t = len(mono["structure"]["layers"][0]["thickness"]["values"])
-    mono["structure"]["layers"][0]["thickness"]["values"] = [float(thickness)] * n_t
+    mono["structure"]["layers"][0]["thickness"]["values"] = [t] * n_t
     return wt
+
+
+def _clip(v: float, lo: float, hi: float) -> float:
+    return float(min(hi, max(lo, v)))
+
+
+def _clamp_tube_wall(diameter: float, thickness: float) -> float:
+    """Keep tubular wall thickness below D/2 so Frame3DD Area stays > 0."""
+    d = float(diameter)
+    t = float(thickness)
+    if not np.isfinite(d) or d <= 0.0:
+        return _J_LEG_T_LO
+    t_max = _J_T_OVER_D_MAX * d
+    return _clip(t, min(_J_LEG_T_LO, t_max), t_max)
+
+
+def seed_jacket_geometry(
+    wt_geom: dict,
+    r_head: float,
+    foot_head_ratio: float,
+    leg_diameter: float,
+    leg_thickness: float,
+    brace_diameters: list[float] | None = None,
+    brace_thicknesses: list[float] | None = None,
+) -> dict:
+    """Overwrite jacket sizing DVs (keeps height / n_bays / bay_spacing)."""
+    wt = copy.deepcopy(wt_geom)
+    jacket = wt["components"]["jacket"]
+    n_bays = int(jacket.get("n_bays", len(jacket.get("brace_diameters", [])) or 3))
+    jacket["r_head"] = float(r_head)
+    jacket["r_foot"] = float(r_head) * float(foot_head_ratio)
+    leg_d = _clip(float(leg_diameter), _J_LEG_D_LO, _J_LEG_D_HI)
+    leg_t = _clamp_tube_wall(leg_d, _clip(float(leg_thickness), _J_LEG_T_LO, _J_LEG_T_HI))
+    jacket["leg_diameter"] = leg_d
+    jacket["leg_thickness"] = leg_t
+
+    def _brace(key: str, vals: list[float] | None, default: float) -> list[float]:
+        if vals is None:
+            old = list(jacket.get(key, []))
+            seed = float(old[-1]) if old else float(default)
+            return [seed] * n_bays
+        arr = [float(x) for x in vals]
+        if len(arr) == n_bays:
+            return arr
+        if len(arr) == 1:
+            return arr * n_bays
+        if len(arr) > n_bays:
+            return arr[:n_bays]
+        return arr + [arr[-1]] * (n_bays - len(arr))
+
+    brace_d = [
+        _clip(d, _J_BRACE_D_LO, _J_BRACE_D_HI)
+        for d in _brace("brace_diameters", brace_diameters, 1.0)
+    ]
+    raw_t = _brace("brace_thicknesses", brace_thicknesses, 0.1)
+    if len(raw_t) != len(brace_d):
+        raw_t = (raw_t + [raw_t[-1]] * len(brace_d))[: len(brace_d)]
+    brace_t = [
+        _clamp_tube_wall(d, _clip(t, _J_BRACE_T_LO, _J_BRACE_T_HI))
+        for d, t in zip(brace_d, raw_t)
+    ]
+    jacket["brace_diameters"] = brace_d
+    jacket["brace_thicknesses"] = brace_t
+    return wt
+
+
+def extract_jacket_dvs(wt_opt) -> tuple[float, float, float, float, list[float], list[float]]:
+    """Return (r_head, foot_head_ratio, leg_D, leg_t, brace_Ds, brace_ts)."""
+    r_head = float(_safe_get(wt_opt, "jacket.r_head", units="m"))
+    ratio = float(_safe_get(wt_opt, "jacket.foot_head_ratio"))
+    if not np.isfinite(ratio):
+        r_foot = float(_safe_get(wt_opt, "fixedse.r_foot", units="m"))
+        ratio = r_foot / r_head if np.isfinite(r_head) and r_head > 0 else float("nan")
+    leg_d = float(_safe_get(wt_opt, "jacket.leg_diameter", units="m"))
+    leg_t = float(_safe_get(wt_opt, "jacket.leg_thickness", units="m"))
+    try:
+        brace_d = _as_float_list(wt_opt.get_val("jacket.brace_diameters", units="m"))
+    except Exception:
+        brace_d = [1.0]
+    try:
+        brace_t = _as_float_list(wt_opt.get_val("jacket.brace_thicknesses", units="m"))
+    except Exception:
+        brace_t = [0.1]
+    return r_head, ratio, leg_d, leg_t, brace_d, brace_t
+
+
+def scale_jacket_cold_start(wt_geom: dict) -> dict:
+    """
+    Replace the shared NREL5MW jacket seed with a tower-scaled start.
+
+    r_head sits on D_tower (coupling floor). Foot flare targets the mid of the
+    practical batter band (r_foot - r_head)/height ≈ 0.125.
+    """
+    d_tow = tower_base_diameter_from_geom(wt_geom)
+    r_head = _clip(d_tow, _J_RHEAD_LO, _J_RHEAD_HI)
+    height = float(wt_geom["components"]["jacket"].get("height", 40.0))
+    if height <= 0.0:
+        height = 40.0
+    # Mid of [0.1, 0.15] flare band → ratio = 1 + flare * H / r_head
+    flare_target = 0.5 * (_J_FLARE_LO + _J_FLARE_HI)
+    ratio = _clip(1.0 + flare_target * height / r_head, _J_RATIO_LO, _J_RATIO_HI)
+    leg_d = _clip(0.28 * d_tow, _J_LEG_D_LO, _J_LEG_D_HI)
+    leg_t = _clip(0.01 * d_tow, _J_LEG_T_LO, _J_LEG_T_HI)
+    brace_d = _clip(0.55 * leg_d, _J_BRACE_D_LO, _J_BRACE_D_HI)
+    brace_t = _clip(max(_J_BRACE_T_LO, 0.5 * leg_t), _J_BRACE_T_LO, _J_BRACE_T_HI)
+    print(
+        f"  Cold-start jacket from D_tower={d_tow:.3f} m: "
+        f"r_head={r_head:.3f} m, ratio={ratio:.3f} "
+        f"(flare≈{flare_target:.3f}), "
+        f"leg_D={leg_d:.3f} m, leg_t={leg_t*1e3:.1f} mm, "
+        f"brace_D={brace_d:.3f} m, brace_t={brace_t*1e3:.1f} mm"
+    )
+    return seed_jacket_geometry(
+        wt_geom, r_head, ratio, leg_d, leg_t, [brace_d], [brace_t]
+    )
+
+
+def scale_monopile_cold_start(wt_geom: dict) -> dict:
+    """
+    Replace the shared NREL5MW monopile seed with a tower-scaled start.
+
+    Uniform D sits on D_tower (diameter-coupling floor). Thickness keeps the
+    baseline wall or a mild D-scaled minimum, whichever is larger.
+    """
+    d_tow = tower_base_diameter_from_geom(wt_geom)
+    d = _clip(d_tow, _D_LO, _D_HI)
+    try:
+        t0 = float(
+            wt_geom["components"]["monopile"]["structure"]["layers"][0]["thickness"]["values"][0]
+        )
+    except Exception:
+        t0 = _T_LO
+    t = _clip(max(t0, 0.008 * d), _T_LO, _T_HI)
+    print(
+        f"  Cold-start monopile from D_tower={d_tow:.3f} m: "
+        f"D={d:.3f} m, t={t*1e3:.1f} mm"
+    )
+    return seed_monopile_diameter_thickness(wt_geom, d, t)
+
+
+def patch_monopile_diameter_bounds(analysis: dict, wt_geom: dict) -> dict:
+    """Raise monopile outer_diameter DV lower_bound to the tower-base floor."""
+    opts = copy.deepcopy(analysis)
+    d_floor = monopile_diameter_floor(wt_geom)
+    od = (
+        opts.setdefault("design_variables", {})
+        .setdefault("monopile", {})
+        .setdefault("outer_diameter", {})
+    )
+    lo = float(od.get("lower_bound", _D_LO))
+    hi = float(od.get("upper_bound", _D_HI))
+    new_lo = max(lo, d_floor)
+    if new_lo > hi:
+        raise ValueError(
+            f"Monopile D floor {new_lo:.3f} m exceeds DV upper_bound {hi:.3f} m "
+            f"(tower base / coupling)"
+        )
+    od["lower_bound"] = new_lo
+    print(
+        f"  Monopile D DV bounds: lower={new_lo:.3f} m (tower-base floor), "
+        f"upper={hi:.3f} m"
+    )
+    return opts
 
 
 def extract_monopile_dt(wt_opt) -> tuple[float, float]:
@@ -289,14 +953,13 @@ def extract_monopile_dt(wt_opt) -> tuple[float, float]:
 
 
 def write_optimised_monopile_geometry(wt_geom: dict, wt_opt, modeling: dict, cdr) -> dict:
-    """
-    After sizing, set L_emb = 5 * D_opt and copy optimised D/t into geometry.
-    """
+    """After sizing, set L_emb = 5 * D_opt and copy optimised D/t into geometry."""
     wt = copy.deepcopy(wt_geom)
     mono = wt["components"]["monopile"]
+    d_floor = monopile_diameter_floor(wt)
 
     diam = _as_float_list(wt_opt.get_val("monopile.diameter", units="m"))
-    # Keep geometry grid length; broadcast / trim as needed
+    diam = [max(float(x), d_floor) for x in diam]
     n = len(mono["outer_shape"]["outer_diameter"]["values"])
     if len(diam) == 1:
         diam_vals = diam * n
@@ -308,7 +971,6 @@ def write_optimised_monopile_geometry(wt_geom: dict, wt_opt, modeling: dict, cdr
 
     try:
         thick = np.atleast_2d(np.asarray(wt_opt.get_val("monopile.layer_thickness", units="m"), dtype=float))
-        # thick shape (n_layers, n_height)
         layer0 = thick[0].flatten()
         n_t = len(mono["structure"]["layers"][0]["thickness"]["values"])
         if layer0.size == 1:
@@ -334,7 +996,6 @@ def analysis_refresh_options(analysis: dict) -> dict:
     """Disable optimisation for the monopile embedment refresh pass."""
     opts = copy.deepcopy(analysis)
     opts.setdefault("driver", {}).setdefault("optimization", {})["flag"] = False
-    # Ensure height remains a non-DV even if schema defaults differ
     mono = opts.setdefault("design_variables", {}).setdefault("monopile", {})
     mono.setdefault("height", {})["flag"] = False
     mono.setdefault("outer_diameter", {})["flag"] = False
@@ -342,14 +1003,27 @@ def analysis_refresh_options(analysis: dict) -> dict:
     return opts
 
 
-def analysis_stage1_strength(analysis: dict) -> dict:
-    """
-    Stage 1: full monopile constraints including frequency.
+def analysis_jacket_run_only(analysis: dict) -> dict:
+    """Disable optimisation for jacket preflight / diagnostic run_only passes."""
+    opts = copy.deepcopy(analysis)
+    opts.setdefault("driver", {}).setdefault("optimization", {})["flag"] = False
+    jacket = opts.setdefault("design_variables", {}).setdefault("jacket", {})
+    for key in (
+        "foot_head_ratio",
+        "r_head",
+        "leg_thickness",
+        "leg_diameter",
+        "brace_diameters",
+        "brace_thicknesses",
+        "height",
+        "bay_spacing",
+    ):
+        jacket.setdefault(key, {})["flag"] = False
+    return opts
 
-    Frequency stays on: the soft-stiff band (see analysis_options) prevents a
-    strength-only pass from locking onto an over-stiff thick design that Stage 2
-    then tears down into buckling-infeasible thin walls.
-    """
+
+def analysis_stage1_strength(analysis: dict) -> dict:
+    """Stage 1: full monopile constraints including frequency."""
     opts = copy.deepcopy(analysis)
     opts.setdefault("constraints", {}).setdefault("monopile", {}).setdefault("frequency_1", {})["flag"] = True
     opts.setdefault("driver", {}).setdefault("optimization", {})["max_iter"] = STAGE1_MAX_ITER
@@ -361,6 +1035,18 @@ def analysis_stage2_full(analysis: dict) -> dict:
     opts = copy.deepcopy(analysis)
     opts.setdefault("constraints", {}).setdefault("monopile", {}).setdefault("frequency_1", {})["flag"] = True
     return opts
+
+
+def analysis_jacket_stage1(analysis: dict) -> dict:
+    """Stage 1 jacket: keep YAML constraints, shorter iteration budget."""
+    opts = copy.deepcopy(analysis)
+    opts.setdefault("driver", {}).setdefault("optimization", {})["max_iter"] = STAGE1_MAX_ITER
+    return opts
+
+
+def analysis_jacket_stage2(analysis: dict) -> dict:
+    """Stage 2 jacket: keep YAML constraints, standard iteration budget."""
+    return copy.deepcopy(analysis)
 
 
 def get_opt_exit_mode(wt_opt) -> Any:
@@ -389,7 +1075,7 @@ def get_opt_exit_mode(wt_opt) -> Any:
         if success is True:
             return 0
         if success is False:
-            return 8  # typical SLSQP linesearch failure in this workflow
+            return 8
     fail = getattr(driver, "_failed", None)
     if fail is False:
         return 0
@@ -425,6 +1111,9 @@ def max_strength_utilization(wt_opt) -> float:
         "fixedse.post.constr_stress",
         "fixedse.post.constr_global_buckling",
         "fixedse.post.constr_shell_buckling",
+        "fixedse.constr_stress",
+        "fixedse.constr_global_buckling",
+        "fixedse.constr_shell_buckling",
     ):
         v = _safe_get(wt_opt, name, reduce="max")
         if np.isfinite(v):
@@ -432,14 +1121,15 @@ def max_strength_utilization(wt_opt) -> float:
     return float(max(vals)) if vals else float("nan")
 
 
-def design_is_warmstart_safe(wt_opt) -> bool:
-    """True if strength utils and f1 look feasible enough to seed the next soil case."""
+def design_is_warmstart_safe(wt_opt, f_lo: float, f_hi: float, check_frequency: bool = True) -> bool:
+    """True if strength utils (and optionally f1) look feasible enough to seed the next case."""
     util = max_strength_utilization(wt_opt)
-    f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
     if not np.isfinite(util) or util > _WARMSTART_MAX_UTIL:
         return False
-    if not np.isfinite(f1) or f1 < _FREQ_LO or f1 > _FREQ_HI:
-        return False
+    if check_frequency:
+        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+        if not np.isfinite(f1) or f1 < f_lo or f1 > f_hi:
+            return False
     return True
 
 
@@ -481,11 +1171,20 @@ def resolve_foundations(mode: str) -> list[str]:
     raise ValueError(f"Invalid --foundation '{mode}'. Use jacket, monopile, or both.")
 
 
-# Match monopile DV bounds in analysis_options_monopile.yaml
 _D_LO = 3.87
-_D_HI = 8.0
+_D_HI = 16.0
 _T_LO = 5e-2
 _T_HI = 2e-1
+
+# Jacket DV clamps (match analysis_options_jacket.yaml)
+_J_RHEAD_LO, _J_RHEAD_HI = 2.0, 20.0
+_J_RATIO_LO, _J_RATIO_HI = 1.1, 5.0
+_J_LEG_D_LO, _J_LEG_D_HI = 0.9, 5.0
+_J_LEG_T_LO, _J_LEG_T_HI = 0.05, 0.1
+_J_BRACE_D_LO, _J_BRACE_D_HI = 0.5, 2.0
+_J_BRACE_T_LO, _J_BRACE_T_HI = 0.05, 0.1  # keep t < 0.5 * brace_D_lo
+_J_T_OVER_D_MAX = 0.45  # Tube Area → 0 when t >= D
+_J_FLARE_LO, _J_FLARE_HI = 0.1, 0.15  # (r_foot - r_head) / height
 
 
 def repair_feasible_monopile_start(
@@ -496,15 +1195,13 @@ def repair_feasible_monopile_start(
     modeling_out: str,
     tag: str,
     cdr,
+    f_lo: float,
+    f_hi: float,
     max_passes: int = 8,
 ) -> dict:
-    """
-    Nudge D/t with run_only analyses until strength util and f1 are roughly feasible.
-
-    SLSQP often exits mode 8 immediately from a badly infeasible start; this gives
-    the optimiser a point inside / near the feasible region first.
-    """
+    """Nudge D/t with run_only analyses until strength util and f1 are roughly feasible."""
     wt = copy.deepcopy(wt_geom)
+    d_floor = monopile_diameter_floor(wt)
     analysis_ro = analysis_refresh_options(analysis)
     analysis_ro.setdefault("general", {})
     analysis_ro["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_preflight")
@@ -517,6 +1214,7 @@ def repair_feasible_monopile_start(
             float(wt["components"]["monopile"]["outer_shape"]["outer_diameter"]["values"][0]),
             float(wt["components"]["monopile"]["structure"]["layers"][0]["thickness"]["values"][0]),
         )
+        d = max(d, d_floor)
         wt = cdr.apply_wt_geometry_rules(
             seed_monopile_diameter_thickness(wt, d, t),
             modeling,
@@ -529,24 +1227,22 @@ def repair_feasible_monopile_start(
         util = max_strength_utilization(wt_opt)
         f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
         print(f"  [preflight {i}] D={d:.3f} t={t*1e3:.2f} mm  util={util:.3f}  f1={f1:.4f} Hz")
-        if design_is_warmstart_safe(wt_opt):
+        if design_is_warmstart_safe(wt_opt, f_lo, f_hi):
             print("  Preflight: start is feasible enough for SLSQP")
             return wt
 
         d_new, t_new = d, t
         if np.isfinite(util) and util > 1.0:
             t_new = min(_T_HI, max(_T_LO, t * util * 1.05))
-        # With soil springs, larger D raises stiffness/f1 — move opposite to the old heuristic
-        if np.isfinite(f1) and f1 > _FREQ_HI:
-            d_new = max(_D_LO, d - 0.25)
+        if np.isfinite(f1) and f1 > f_hi:
+            d_new = max(d_floor, d - 0.25)
             if not (np.isfinite(util) and util > 1.0):
                 t_new = max(_T_LO, min(t_new, t * 0.95))
-        if np.isfinite(f1) and f1 < _FREQ_LO:
+        if np.isfinite(f1) and f1 < f_lo:
             d_new = min(_D_HI, d + 0.25)
             t_new = min(_T_HI, max(t_new, t * 1.05))
 
         if abs(d_new - d) < 1e-9 and abs(t_new - t) < 1e-12:
-            # Cannot move further within bounds
             print("  Preflight: bounds hit; continuing with best-effort start")
             return wt
         wt = seed_monopile_diameter_thickness(wt, d_new, t_new)
@@ -563,6 +1259,8 @@ def run_monopile_two_stage(
     modeling_out: str,
     tag: str,
     cdr,
+    f_lo: float,
+    f_hi: float,
 ) -> tuple:
     """
     Preflight feasible seed -> Stage 1 (full, shorter) -> Stage 2 polish ->
@@ -570,10 +1268,9 @@ def run_monopile_two_stage(
     """
     print("  Preflight feasible-start repair …")
     wt_geom = repair_feasible_monopile_start(
-        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr
+        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr, f_lo, f_hi
     )
 
-    # --- Stage 1 ---
     analysis_s1 = analysis_stage1_strength(analysis)
     analysis_s1.setdefault("general", {})
     analysis_s1["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_stage1")
@@ -590,12 +1287,14 @@ def run_monopile_two_stage(
 
     d1, t1 = extract_monopile_dt(wt_opt)
     wt_after_s1 = seed_monopile_diameter_thickness(wt_geom, d1, t1)
-    # Keep provisional embedment consistent with Stage-1 D
+    d1 = float(wt_after_s1["components"]["monopile"]["outer_shape"]["outer_diameter"]["values"][0])
+    t1 = float(
+        wt_after_s1["components"]["monopile"]["structure"]["layers"][0]["thickness"]["values"][0]
+    )
     wt_after_s1 = cdr.apply_wt_geometry_rules(
         wt_after_s1, modeling, "monopile", embedment=cdr.embedment_length(d1)
     )
 
-    # --- Stage 2 ---
     analysis_s2 = analysis_stage2_full(analysis)
     analysis_s2.setdefault("general", {})
     analysis_s2["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_stage2")
@@ -611,8 +1310,9 @@ def run_monopile_two_stage(
     print_monopile_diagnostics(wt_opt, "stage2", exit_mode=exit2)
 
     d2, t2 = extract_monopile_dt(wt_opt)
+    d2 = max(d2, monopile_diameter_floor(wt_geom))
+    t2 = _clip(t2, _T_LO, _T_HI)
 
-    # --- Embedment refresh ---
     wt_final = write_optimised_monopile_geometry(wt_after_s1, wt_opt, modeling, cdr)
     wt_refresh = os.path.join(TMP_DIR, f"geometry_{tag}_embedment.yaml")
     analysis_refresh = os.path.join(TMP_DIR, f"analysis_{tag}_refresh.yaml")
@@ -627,75 +1327,462 @@ def run_monopile_two_stage(
     return wt_opt, modeling_options, exit2, d2, t2
 
 
-def run_batch(csv_path: str, foundation_mode: str = "both", stop_on_error: bool = False) -> int:
+def print_jacket_diagnostics(wt_opt, label: str, f_lo: float, f_hi: float, exit_mode=None) -> None:
+    """Log jacket exit mode, geometry, mass, f1 and peak utilizations."""
+    r_head = _safe_get(wt_opt, "jacket.r_head", units="m")
+    r_foot = _safe_get(wt_opt, "fixedse.r_foot", units="m")
+    ratio = _safe_get(wt_opt, "jacket.foot_head_ratio")
+    leg_d = _safe_get(wt_opt, "jacket.leg_diameter", units="m")
+    leg_t = _safe_get(wt_opt, "jacket.leg_thickness", units="m")
+    jmass = _safe_get(wt_opt, "fixedse.jacket_mass", units="kg")
+    f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+    stress = _safe_get(wt_opt, "fixedse.constr_stress", reduce="max")
+    buck_s = _safe_get(wt_opt, "fixedse.constr_shell_buckling", reduce="max")
+    buck_g = _safe_get(wt_opt, "fixedse.constr_global_buckling", reduce="max")
+    em = exit_mode if exit_mode is not None else get_opt_exit_mode(wt_opt)
+    print(
+        f"  [{label}] exit_mode={em}  r_head={r_head:.3f} m  r_foot={r_foot:.3f} m  "
+        f"ratio={ratio:.3f}  leg_D={leg_d:.3f} m  leg_t={leg_t*1e3:.1f} mm  "
+        f"mass={jmass:.1f} kg  f1={f1:.4f} Hz  band=[{f_lo:.4f}, {f_hi:.4f}]"
+    )
+    print(
+        f"  [{label}] max util: stress={stress:.3f}  global_buck={buck_g:.3f}  "
+        f"shell_buck={buck_s:.3f}"
+    )
+
+
+def repair_feasible_jacket_start(
+    run_wisdem,
+    wt_geom: dict,
+    modeling: dict,
+    analysis: dict,
+    modeling_out: str,
+    tag: str,
+    f_lo: float,
+    f_hi: float,
+    max_passes: int = 8,
+) -> dict:
+    """Nudge jacket DVs with run_only analyses until util/f1 look roughly feasible."""
+    wt = copy.deepcopy(wt_geom)
+    freq_on = bool(
+        analysis.get("constraints", {}).get("jacket", {}).get("frequency_1", {}).get("flag", False)
+    )
+    analysis_ro = analysis_jacket_run_only(analysis)
+    analysis_ro.setdefault("general", {})
+    analysis_ro["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_preflight")
+    analysis_ro["general"]["fname_output"] = "refturb_output"
+    analysis_path = os.path.join(TMP_DIR, f"analysis_{tag}_preflight.yaml")
+    dump_yaml(analysis_ro, analysis_path)
+
+    for i in range(max_passes):
+        jacket = wt["components"]["jacket"]
+        r_head = float(jacket["r_head"])
+        ratio = float(jacket["r_foot"]) / r_head if r_head > 0 else 1.5
+        leg_d = float(jacket["leg_diameter"])
+        leg_t = float(jacket["leg_thickness"])
+        brace_d0 = float(jacket["brace_diameters"][0])
+        brace_t0 = float(jacket["brace_thicknesses"][0])
+
+        geom_path = os.path.join(TMP_DIR, f"geometry_{tag}_preflight_{i}.yaml")
+        dump_yaml(wt, geom_path)
+        wt_opt, _, _ = run_wisdem(geom_path, modeling_out, analysis_path, run_only=True)
+        util = max_strength_utilization(wt_opt)
+        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+        print(
+            f"  [preflight {i}] r_head={r_head:.3f} ratio={ratio:.3f} "
+            f"leg_D={leg_d:.3f} leg_t={leg_t*1e3:.1f} mm  "
+            f"util={util:.3f}  f1={f1:.4f} Hz"
+        )
+        if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
+            print("  Preflight: start is feasible enough for SLSQP")
+            return wt
+
+        r_new, ratio_new = r_head, ratio
+        leg_d_new, leg_t_new = leg_d, leg_t
+        brace_d_new, brace_t_new = brace_d0, brace_t0
+
+        # Keep batter in the practical flare band when enabled in analysis YAML
+        height = float(jacket.get("height", 40.0)) or 40.0
+        flare = (r_head * (ratio - 1.0)) / height if height > 0 else 0.0
+        if flare < _J_FLARE_LO or flare > _J_FLARE_HI:
+            flare_tgt = 0.5 * (_J_FLARE_LO + _J_FLARE_HI)
+            ratio_new = _clip(1.0 + flare_tgt * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI)
+
+        if np.isfinite(util) and util > 1.0:
+            scale = min(1.5, float(util) * 1.05)
+            leg_d_new = _clip(leg_d * scale, _J_LEG_D_LO, _J_LEG_D_HI)
+            leg_t_new = _clamp_tube_wall(
+                leg_d_new, _clip(leg_t * scale, _J_LEG_T_LO, _J_LEG_T_HI)
+            )
+            brace_d_new = _clip(brace_d0 * scale, _J_BRACE_D_LO, _J_BRACE_D_HI)
+            brace_t_new = _clamp_tube_wall(
+                brace_d_new, _clip(brace_t0 * scale, _J_BRACE_T_LO, _J_BRACE_T_HI)
+            )
+
+        if freq_on and np.isfinite(f1) and f1 < f_lo:
+            # Too soft: widen base and fatten members (keep within flare band)
+            ratio_new = _clip(ratio + 0.15, _J_RATIO_LO, _J_RATIO_HI)
+            flare_new = (r_new * (ratio_new - 1.0)) / height if height > 0 else 0.0
+            if flare_new > _J_FLARE_HI:
+                ratio_new = _clip(
+                    1.0 + _J_FLARE_HI * height / max(r_new, 1e-6), _J_RATIO_LO, _J_RATIO_HI
+                )
+            r_new = _clip(r_head + 0.25, _J_RHEAD_LO, _J_RHEAD_HI)
+            leg_d_new = _clip(max(leg_d_new, leg_d + 0.2), _J_LEG_D_LO, _J_LEG_D_HI)
+            brace_d_new = _clip(max(brace_d_new, brace_d0 + 0.1), _J_BRACE_D_LO, _J_BRACE_D_HI)
+        elif freq_on and np.isfinite(f1) and f1 > f_hi:
+            # Too stiff: trim flare / members (keep r_head >= D_tower)
+            d_tow = tower_base_diameter_from_geom(wt)
+            ratio_new = _clip(ratio - 0.1, _J_RATIO_LO, _J_RATIO_HI)
+            flare_new = (r_head * (ratio_new - 1.0)) / height if height > 0 else 0.0
+            if flare_new < _J_FLARE_LO:
+                ratio_new = _clip(
+                    1.0 + _J_FLARE_LO * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI
+                )
+            r_new = _clip(max(d_tow, r_head - 0.25), _J_RHEAD_LO, _J_RHEAD_HI)
+            if not (np.isfinite(util) and util > 1.0):
+                leg_d_new = _clip(leg_d * 0.95, _J_LEG_D_LO, _J_LEG_D_HI)
+                brace_d_new = _clip(brace_d0 * 0.95, _J_BRACE_D_LO, _J_BRACE_D_HI)
+
+        d_tow = tower_base_diameter_from_geom(wt)
+        r_new = max(r_new, d_tow)
+
+        unchanged = (
+            abs(r_new - r_head) < 1e-9
+            and abs(ratio_new - ratio) < 1e-12
+            and abs(leg_d_new - leg_d) < 1e-9
+            and abs(leg_t_new - leg_t) < 1e-12
+            and abs(brace_d_new - brace_d0) < 1e-9
+            and abs(brace_t_new - brace_t0) < 1e-12
+        )
+        if unchanged:
+            print("  Preflight: bounds hit; continuing with best-effort start")
+            return wt
+
+        wt = seed_jacket_geometry(
+            wt, r_new, ratio_new, leg_d_new, leg_t_new, [brace_d_new], [brace_t_new]
+        )
+
+    print("  Preflight: max passes reached; continuing with best-effort start")
+    return wt
+
+
+def run_jacket_two_stage(
+    run_wisdem,
+    wt_geom: dict,
+    modeling: dict,
+    analysis: dict,
+    modeling_out: str,
+    tag: str,
+    f_lo: float,
+    f_hi: float,
+) -> tuple:
+    """
+    Preflight feasible seed -> Stage 1 (shorter) -> Stage 2 polish.
+    Returns (wt_opt, modeling_options, opt_exit_mode, jacket_dv_tuple).
+    """
+    print("  Preflight feasible-start repair …")
+    wt_geom = repair_feasible_jacket_start(
+        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
+    )
+
+    analysis_s1 = analysis_jacket_stage1(analysis)
+    analysis_s1.setdefault("general", {})
+    analysis_s1["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_stage1")
+    analysis_s1["general"]["fname_output"] = "refturb_output"
+    analysis_s1_path = os.path.join(TMP_DIR, f"analysis_{tag}_stage1.yaml")
+    wt_s1_path = os.path.join(TMP_DIR, f"geometry_{tag}_stage1.yaml")
+    dump_yaml(analysis_s1, analysis_s1_path)
+    dump_yaml(wt_geom, wt_s1_path)
+
+    print("  Stage 1 (full constraints, shorter budget) …")
+    wt_opt, modeling_options, _opt = run_wisdem(wt_s1_path, modeling_out, analysis_s1_path)
+    exit1 = get_opt_exit_mode(wt_opt)
+    print_jacket_diagnostics(wt_opt, "stage1", f_lo, f_hi, exit_mode=exit1)
+
+    r_head, ratio, leg_d, leg_t, brace_d, brace_t = extract_jacket_dvs(wt_opt)
+    wt_after_s1 = seed_jacket_geometry(
+        wt_geom, r_head, ratio, leg_d, leg_t, brace_d, brace_t
+    )
+
+    analysis_s2 = analysis_jacket_stage2(analysis)
+    analysis_s2.setdefault("general", {})
+    analysis_s2["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_stage2")
+    analysis_s2["general"]["fname_output"] = "refturb_output"
+    analysis_s2_path = os.path.join(TMP_DIR, f"analysis_{tag}_stage2.yaml")
+    wt_s2_path = os.path.join(TMP_DIR, f"geometry_{tag}_stage2.yaml")
+    dump_yaml(analysis_s2, analysis_s2_path)
+    dump_yaml(wt_after_s1, wt_s2_path)
+
+    print("  Stage 2 (full constraints, polish) …")
+    wt_opt, modeling_options, _opt = run_wisdem(wt_s2_path, modeling_out, analysis_s2_path)
+    exit2 = get_opt_exit_mode(wt_opt)
+    print_jacket_diagnostics(wt_opt, "stage2", f_lo, f_hi, exit_mode=exit2)
+
+    dvs = extract_jacket_dvs(wt_opt)
+    return wt_opt, modeling_options, exit2, dvs
+
+
+def _first_dlc_vec3(val, units_name: str) -> np.ndarray:
+    """Reduce DriveSE base_F/M shaped (3,) or (3, n_dlc) to a length-3 vector."""
+    arr = np.asarray(val, dtype=float)
+    if arr.ndim == 2 and arr.shape[0] == 3:
+        return arr[:, 0]
+    flat = arr.flatten()
+    if flat.size < 3:
+        raise ValueError(f"{units_name} has fewer than 3 components: shape={arr.shape}")
+    return flat[:3]
+
+
+def extract_rna_loads(wt_opt) -> dict:
+    """
+    Extract loads from a RotorSE+DriveSE run.
+
+    - force/moment/mass/... : RNA (tower-top) values for Loading injection
+    - shear_N / vertical_N / overturning_Nm : tower-base reactions for results CSV
+      (towerse.tower.turbine_F/M; OT = My)
+    """
+    force = _first_dlc_vec3(wt_opt.get_val("drivese.base_F", units="N"), "drivese.base_F")
+    moment = _first_dlc_vec3(wt_opt.get_val("drivese.base_M", units="N*m"), "drivese.base_M")
+    turb_F = _first_dlc_vec3(
+        wt_opt.get_val("towerse.tower.turbine_F", units="N"), "towerse.tower.turbine_F"
+    )
+    turb_M = _first_dlc_vec3(
+        wt_opt.get_val("towerse.tower.turbine_M", units="N*m"), "towerse.tower.turbine_M"
+    )
+
+    mass = float(np.asarray(wt_opt.get_val("drivese.rna_mass", units="kg"), dtype=float).flatten()[0])
+    cm = np.atleast_1d(np.asarray(wt_opt.get_val("drivese.rna_cm", units="m"), dtype=float)).flatten()
+    moi = np.atleast_1d(np.asarray(wt_opt.get_val("drivese.rna_I_TT", units="kg*m**2"), dtype=float)).flatten()
+
+    velocity = _safe_get(wt_opt, "rotorse.rp.powercurve.rated_V", units="m/s")
+    if not np.isfinite(velocity):
+        velocity = _safe_get(wt_opt, "towerse.env.Uref", units="m/s")
+    if not np.isfinite(velocity):
+        velocity = 11.73732
+
+    hub_height = _safe_get(wt_opt, "high_level_tower_props.hub_height", units="m")
+    rated_thrust = _safe_get(wt_opt, "rotorse.rp.powercurve.rated_T", units="N")
+
+    loads = {
+        # RNA / tower-top — used by Loading-driven sizing
+        "force": [float(force[0]), float(force[1]), float(force[2])],
+        "moment": [float(moment[0]), float(moment[1]), float(moment[2])],
+        "velocity": float(velocity),
+        "mass": mass,
+        "center_of_mass": [float(x) for x in cm[:3]] + [0.0] * max(0, 3 - cm.size),
+        "moment_of_inertia": [float(x) for x in moi[:6]] + [0.0] * max(0, 6 - moi.size),
+        # Tower-base reactions — written to results CSV
+        "shear_N": float(turb_F[0]),
+        "vertical_N": float(turb_F[2]),
+        "overturning_Nm": float(turb_M[1]),
+        "hub_height_m": float(hub_height) if np.isfinite(hub_height) else float("nan"),
+        "rated_thrust_N": float(rated_thrust) if np.isfinite(rated_thrust) else float("nan"),
+    }
+    return loads
+
+
+def compute_loads_stage(
+    run_wisdem,
+    full_wt: dict,
+    scenario: dict,
+    foundation_type: str,
+    tag: str,
+    cdr,
+) -> dict:
+    """Stage 1: RotorSE+DriveSE run_only to compute RNA + tower-base loads."""
+    modeling = patch_environment(load_yaml(MODELING_ROTORSE), scenario, for_rotorse=True)
+    # Jacket FixedBottomSE options differ slightly; keep soil springs for monopile
+    if foundation_type == "jacket":
+        modeling.setdefault("WISDEM", {}).setdefault("FixedBottomSE", {})["soil_springs"] = False
+
+    analysis = load_yaml(ANALYSIS_LOADS)
+    analysis.setdefault("general", {})
+    analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_loads")
+    analysis["general"]["fname_output"] = "refturb_output"
+
+    wt_geom = patch_geometry(full_wt, modeling, foundation_type, cdr)
+
+    modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}_loads.yaml")
+    analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}_loads.yaml")
+    wt_out = os.path.join(TMP_DIR, f"geometry_{tag}_loads.yaml")
+    dump_yaml(modeling, modeling_out)
+    dump_yaml(analysis, analysis_out)
+    dump_yaml(wt_geom, wt_out)
+
+    print("  Stage loads: RotorSE+DriveSE run_only …")
+    print(f"  V_mean (from V50/7) = {modeling['Environment'].get('V_mean')}")
+    wt_opt, _, _ = run_wisdem(wt_out, modeling_out, analysis_out, run_only=True)
+    loads = extract_rna_loads(wt_opt)
+    print(
+        f"  hub_height={loads['hub_height_m']:.3g} m, "
+        f"rated_thrust={loads['rated_thrust_N']:.6g} N, "
+        f"RNA mass={loads['mass']:.6g} kg"
+    )
+    print(
+        f"  Tower-base loads: shear={loads['shear_N']:.6g} N, "
+        f"vertical={loads['vertical_N']:.6g} N, "
+        f"OT(My)={loads['overturning_Nm']:.6g} N·m, "
+        f"Uref={loads['velocity']:.4g} m/s"
+    )
+    print(
+        f"  RNA (Loading) Fx/Fz/My = "
+        f"{loads['force'][0]:.6g} / {loads['force'][2]:.6g} / {loads['moment'][1]:.6g}"
+    )
+    return loads
+
+
+def scenario_result_extras(scenario: dict, loads: dict, f_lo: float = None, f_hi: float = None, exit_mode=None) -> dict:
+    """Site + tower-base load fields written into results_monopile.csv / results_jacket.csv."""
+    extras = {
+        "tower_base_shear_N": loads["shear_N"],
+        "tower_base_vertical_N": loads["vertical_N"],
+        "tower_base_overturning_moment_Nm": loads["overturning_Nm"],
+        "turbine_rating_W": _to_float(scenario["turbine_rating_W"]),
+        "V50_mps": _to_float(scenario["V50_mps"]),
+        "Hs50_m": _to_float(scenario["Hs50_m"]),
+        "soil_shear_modulus_Pa": _to_float(scenario["soil_shear_modulus_Pa"]),
+        "water_depth_m": _to_float(scenario["water_depth_m"]),
+    }
+    if exit_mode is not None and not (isinstance(exit_mode, float) and not math.isfinite(exit_mode)):
+        try:
+            extras["opt_exit_mode"] = int(exit_mode)
+        except (TypeError, ValueError):
+            extras["opt_exit_mode"] = exit_mode
+    return extras
+
+
+def run_batch(
+    csv_path: str,
+    turbine_csv: str,
+    foundation_mode: str = "both",
+    stop_on_error: bool = False,
+) -> int:
     run_wisdem, append_foundation_results, cdr = _setup_wisdem()
     scenarios = read_scenarios(csv_path)
+    turbines = load_turbine_lookup(turbine_csv)
     foundations = resolve_foundations(foundation_mode)
     os.makedirs(TMP_DIR, exist_ok=True)
 
     baselines_modeling = {ftype: load_yaml(BASELINES[ftype]["modeling"]) for ftype in foundations}
     baselines_wt = {ftype: load_yaml(BASELINES[ftype]["wt"]) for ftype in foundations}
 
-    # Warm-start cache: site/load key -> (D, t) from last successful monopile Stage-2
     mono_warmstart: dict[tuple, tuple[float, float]] = {}
+    jacket_warmstart: dict[tuple, tuple] = {}
 
     n_ok = 0
     n_fail = 0
     print(f"Loaded {len(scenarios)} scenario row(s) from {csv_path}")
+    print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
 
     for scenario in scenarios:
         row_num = scenario["_csv_row_number"]
+        rating = _to_float(scenario["turbine_rating_W"])
+        turb_name, turb_params = lookup_turbine_column(turbines, rating, turbine_csv)
+        print(f"\n### CSV row {row_num}: rating={rating:g} W -> turbine '{turb_name}' ###")
+
         for ftype in foundations:
             paths = BASELINES[ftype]
             tag = f"{ftype}_row{row_num}"
-            modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}.yaml")
-            analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}.yaml")
-            wt_out = os.path.join(TMP_DIR, f"geometry_{tag}.yaml")
-
-            analysis = load_yaml(paths["analysis"])
-            analysis.setdefault("general", {})
-            analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}")
-            analysis["general"]["fname_output"] = "refturb_output"
-            dump_yaml(analysis, analysis_out)
-
-            modeling = patch_modeling_options(baselines_modeling[ftype], scenario)
-            dump_yaml(modeling, modeling_out)
-
-            site = cdr.resolve_site_params(modeling)
-            print(f"\n=== Running {ftype} scenario CSV row {row_num} ===")
-            print(
-                f"  Site: WD={site['water_depth']:.3f} m, Hs={site['hs']:.3f} m, "
-                f"H_free={site['H_free']:.3f} m"
-            )
-            g_soil = modeling.get("Environment", {}).get("soil_shear_modulus", None)
-            if g_soil is not None:
-                print(f"  soil_shear_modulus = {g_soil:.6g} Pa")
-            if ftype == "jacket":
-                print(f"  Jacket topology: n_legs=4, n_bays={cdr.n_bays_from_height(site['H_free'])}")
-
-            wt_geom = patch_geometry(baselines_wt[ftype], modeling, ftype, cdr)
-
-            # Soil-sweep warm start: only G differs; skip if last design was infeasible
-            ws_key = _scenario_key_for_warmstart(scenario)
-            if ftype == "monopile" and ws_key in mono_warmstart:
-                d_ws, t_ws = mono_warmstart[ws_key]
-                print(f"  Warm-start from previous soil case: D={d_ws:.4f} m, t={t_ws*1e3:.2f} mm")
-                wt_geom = seed_monopile_diameter_thickness(wt_geom, d_ws, t_ws)
-                wt_geom = cdr.apply_wt_geometry_rules(
-                    wt_geom, modeling, "monopile", embedment=cdr.embedment_length(d_ws)
-                )
-
-            dump_yaml(wt_geom, wt_out)
-            print(f"  geometry: {wt_out}")
-            print(f"  modeling: {modeling_out}")
 
             try:
+                full_wt = build_turbine_geometry(
+                    turb_params, turbine_csv, ftype, baselines_wt[ftype]
+                )
+                f_lo, f_hi = compute_frequency_bounds(full_wt)
+
+                # Stage 1: compute loads
+                loads = compute_loads_stage(
+                    run_wisdem, full_wt, scenario, ftype, tag, cdr
+                )
+
+                # Stage 2: Loading-driven foundation sizing (rated + parked extreme)
+                modeling, extreme = inject_loading(
+                    baselines_modeling[ftype], scenario, loads, full_wt
+                )
+                modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}.yaml")
+                dump_yaml(modeling, modeling_out)
+
+                analysis = load_yaml(paths["analysis"])
+                analysis = patch_frequency_bounds(analysis, f_lo, f_hi, foundation_type=ftype)
+                analysis.setdefault("general", {})
+
+                analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}")
+                analysis["general"]["fname_output"] = "refturb_output"
+                analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}.yaml")
+                dump_yaml(analysis, analysis_out)
+
+                site = cdr.resolve_site_params(modeling)
+                print(f"\n=== Sizing {ftype} scenario CSV row {row_num} ===")
+                print(
+                    f"  Site: WD={site['water_depth']:.3f} m, Hs={site['hs']:.3f} m, "
+                    f"H_free={site['H_free']:.3f} m"
+                )
+                g_soil = modeling.get("Environment", {}).get("soil_shear_modulus", None)
+                if g_soil is not None:
+                    print(f"  soil_shear_modulus = {g_soil:.6g} Pa")
+                print(f"  n_dlc = {modeling['WISDEM'].get('n_dlc')}")
+                print(
+                    f"  DLC1 rated RNA Fx/Fz/My = "
+                    f"{loads['force'][0]:.6g} / {loads['force'][2]:.6g} / {loads['moment'][1]:.6g}, "
+                    f"Uref={loads['velocity']:.4g} m/s"
+                )
+                print(
+                    f"  DLC2 extreme (Cd={extreme['Cd']}, D_rotor={extreme['rotor_diameter_m']:.3g} m) "
+                    f"Fx/Fz/My = "
+                    f"{extreme['force'][0]:.6g} / {extreme['force'][2]:.6g} / {extreme['moment'][1]:.6g}, "
+                    f"Uref={extreme['velocity']:.4g} m/s"
+                )
+                if ftype == "jacket":
+                    print(f"  Jacket topology: n_legs=4, n_bays={cdr.n_bays_from_height(site['H_free'])}")
+
+                slim_wt = slim_sizing_geometry(full_wt, ftype)
+                wt_geom = patch_geometry(slim_wt, modeling, ftype, cdr)
+
+                ws_key = _scenario_key_for_warmstart(scenario)
+                if ftype == "monopile" and ws_key in mono_warmstart:
+                    d_ws, t_ws = mono_warmstart[ws_key]
+                    d_ws = max(d_ws, monopile_diameter_floor(wt_geom))
+                    print(f"  Warm-start from previous soil case: D={d_ws:.4f} m, t={t_ws*1e3:.2f} mm")
+                    wt_geom = seed_monopile_diameter_thickness(wt_geom, d_ws, t_ws)
+                    wt_geom = cdr.apply_wt_geometry_rules(
+                        wt_geom, modeling, "monopile", embedment=cdr.embedment_length(d_ws)
+                    )
+                elif ftype == "monopile":
+                    wt_geom = scale_monopile_cold_start(wt_geom)
+                    d0 = float(
+                        wt_geom["components"]["monopile"]["outer_shape"]["outer_diameter"]["values"][0]
+                    )
+                    wt_geom = cdr.apply_wt_geometry_rules(
+                        wt_geom, modeling, "monopile", embedment=cdr.embedment_length(d0)
+                    )
+                elif ftype == "jacket" and ws_key in jacket_warmstart:
+                    r_h, ratio, leg_d, leg_t, brace_d, brace_t = jacket_warmstart[ws_key]
+                    print(
+                        f"  Warm-start from previous soil case: "
+                        f"r_head={r_h:.3f} m, ratio={ratio:.3f}, leg_D={leg_d:.3f} m"
+                    )
+                    wt_geom = seed_jacket_geometry(
+                        wt_geom, r_h, ratio, leg_d, leg_t, list(brace_d), list(brace_t)
+                    )
+                elif ftype == "jacket":
+                    wt_geom = scale_jacket_cold_start(wt_geom)
+
+                if ftype == "monopile":
+                    analysis = patch_monopile_diameter_bounds(analysis, wt_geom)
+
+                wt_out = os.path.join(TMP_DIR, f"geometry_{tag}.yaml")
+                dump_yaml(wt_geom, wt_out)
+                dump_yaml(analysis, analysis_out)
+                print(f"  geometry: {wt_out}")
+                print(f"  modeling: {modeling_out}")
+
                 if ftype == "monopile":
                     wt_opt, modeling_options, exit_mode, d_opt, t_opt = run_monopile_two_stage(
-                        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr
+                        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr, f_lo, f_hi
                     )
-                    if design_is_warmstart_safe(wt_opt):
+                    if design_is_warmstart_safe(wt_opt, f_lo, f_hi):
                         mono_warmstart[ws_key] = (d_opt, t_opt)
                     else:
                         util = max_strength_utilization(wt_opt)
@@ -705,18 +1792,48 @@ def run_batch(csv_path: str, foundation_mode: str = "both", stop_on_error: bool 
                             "next soil row will cold-start"
                         )
                         mono_warmstart.pop(ws_key, None)
-                    extras = {"opt_exit_mode": exit_mode}
-                    out_csv = append_foundation_results(
-                        wt_opt, modeling_options, extras=extras
-                    )
+                    extras = scenario_result_extras(scenario, loads, f_lo, f_hi, exit_mode=exit_mode)
+                    out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
                 else:
-                    wt_opt, modeling_options, _opt = run_wisdem(wt_out, modeling_out, analysis_out)
-                    extras = {"opt_exit_mode": get_opt_exit_mode(wt_opt)}
-                    out_csv = append_foundation_results(
-                        wt_opt, modeling_options, extras=extras
+                    wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
+                        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
                     )
+                    freq_on = bool(
+                        analysis.get("constraints", {})
+                        .get("jacket", {})
+                        .get("frequency_1", {})
+                        .get("flag", False)
+                    )
+                    if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
+                        r_h, ratio, leg_d, leg_t, brace_d, brace_t = j_dvs
+                        jacket_warmstart[ws_key] = (
+                            r_h,
+                            ratio,
+                            leg_d,
+                            leg_t,
+                            tuple(brace_d),
+                            tuple(brace_t),
+                        )
+                    else:
+                        util = max_strength_utilization(wt_opt)
+                        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+                        print(
+                            f"  Skipping jacket warm-start cache (util={util:.3f}, f1={f1:.4f} Hz); "
+                            "next soil row will cold-start"
+                        )
+                        jacket_warmstart.pop(ws_key, None)
+                    extras = scenario_result_extras(
+                        scenario, loads, f_lo, f_hi, exit_mode=exit_mode
+                    )
+                    out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
 
                 print(f"  OK -> {out_csv}")
+                if exit_mode is not None and exit_mode != 0:
+                    print(
+                        f"  NOTE: optimizer exit_mode={exit_mode} "
+                        "(0=success; 8=linesearch stuck; 9=iteration limit). "
+                        "Row was still appended — check opt_exit_mode / f1_Hz in CSV."
+                    )
                 n_ok += 1
             except Exception as exc:
                 n_fail += 1
@@ -731,11 +1848,16 @@ def run_batch(csv_path: str, foundation_mode: str = "both", stop_on_error: bool 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run WISDEM foundation scenarios from a CSV of key inputs."
+        description="Run WISDEM foundation scenarios from site + turbine lookup CSVs."
     )
     parser.add_argument(
         "input_csv",
-        help="Path to any CSV with the required column names (extra columns ignored).",
+        help="Site CSV with turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m.",
+    )
+    parser.add_argument(
+        "--turbine-csv",
+        default=DEFAULT_TURBINE_CSV,
+        help=f"Turbine lookup CSV (default: {DEFAULT_TURBINE_CSV}).",
     )
     parser.add_argument(
         "--foundation",
@@ -749,7 +1871,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Stop at the first failed scenario instead of continuing.",
     )
     args = parser.parse_args(argv)
-    return run_batch(args.input_csv, foundation_mode=args.foundation, stop_on_error=args.stop_on_error)
+    return run_batch(
+        args.input_csv,
+        turbine_csv=args.turbine_csv,
+        foundation_mode=args.foundation,
+        stop_on_error=args.stop_on_error,
+    )
 
 
 if __name__ == "__main__":
