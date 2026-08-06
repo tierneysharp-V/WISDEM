@@ -1,4 +1,5 @@
 # Generic modeling options file to run standard WISDEM case
+# foundation_batch runtime overrides n_dlc=2 (rated GustETM + parked extreme at V50)
 General:
     verbosity: False  # When set to True, the code prints to screen many infos
 WISDEM:

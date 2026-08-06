@@ -1203,6 +1203,14 @@ class PoseOptimization(object):
         if jacket_constr["tower_diameter_coupling"]["flag"]:
             wt_opt.model.add_constraint("fixedse.constr_diam_consistency", upper=1.0)
 
+        if jacket_constr.get("flare", {}).get("flag", False):
+            flare = jacket_constr["flare"]
+            wt_opt.model.add_constraint(
+                "fixedse.constr_jacket_flare",
+                lower=flare.get("lower_bound", 0.1),
+                upper=flare.get("upper_bound", 0.15),
+            )
+
         if jacket_constr["frequency_1"]["flag"]:
             wt_opt.model.add_constraint(
                 "fixedse.structural_frequencies",

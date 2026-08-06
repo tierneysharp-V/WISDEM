@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 BATCH_DIR = os.path.dirname(os.path.realpath(__file__))
 LOG_DIR = os.path.join(BATCH_DIR, "logs")
 SCENARIOS = os.path.join(BATCH_DIR, "diagnostic_scenarios.csv")
+TURBINE_CSV = os.path.join(BATCH_DIR, "turbine_lookup.csv")
 RUNNER = os.path.join(BATCH_DIR, "run_foundation_batch.py")
 
 
@@ -18,7 +19,15 @@ def run_one(foundation: str) -> int:
     log_path = os.path.join(LOG_DIR, f"diagnostic_{foundation}.log")
     ec_path = os.path.join(LOG_DIR, f"diagnostic_{foundation}.exitcode")
     stamp = datetime.now(timezone.utc).isoformat()
-    cmd = [sys.executable, RUNNER, SCENARIOS, "--foundation", foundation]
+    cmd = [
+        sys.executable,
+        RUNNER,
+        SCENARIOS,
+        "--turbine-csv",
+        TURBINE_CSV,
+        "--foundation",
+        foundation,
+    ]
     with open(log_path, "w", encoding="utf-8") as log:
         log.write(f"=== START {foundation} {stamp} ===\n")
         log.write(f"cmd: {' '.join(cmd)}\n")

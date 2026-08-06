@@ -1,0 +1,66 @@
+# RotorSE/DriveSE load-computation baseline for foundation_batch Stage 1
+# LCOE must be True whenever blades are present (PlantFinance is always added with blades).
+General:
+    verbosity: False
+WISDEM:
+    n_dlc: 1
+    RotorSE:
+        flag: True
+        spar_cap_ss: Spar_Cap_SS
+        spar_cap_ps: Spar_Cap_PS
+        te_ss: TE_reinforcement_SS
+        te_ps: TE_reinforcement_PS
+    DriveSE:
+        flag: True
+    TowerSE:
+        flag: True
+        wind: PowerWind
+        gamma_f: 1.35
+        gamma_m: 1.3
+        gamma_n: 1.0
+        gamma_b: 1.1
+        gamma_fatigue: 1.755
+        buckling_method: dnvgl
+        buckling_length: 15
+        frame3dd:
+            shear: True
+            geom: True
+            tol: 1e-9
+    FixedBottomSE:
+        flag: True
+        soil_springs: True
+        wind: PowerWind
+        gamma_f: 1.35
+        gamma_m: 1.3
+        gamma_n: 1.0
+        gamma_b: 1.1
+        gamma_fatigue: 1.755
+        buckling_method: dnvgl
+        buckling_length: 15
+        save_truss_figures: False
+        frame3dd:
+            shear: True
+            geom: True
+            tol: 1e-9
+    BOS:
+        flag: False
+    LCOE:
+        flag: True
+        labor_rate: 58.8
+        painting_rate: 30.0
+    OpEx:
+        flag: False
+Environment:
+    air_density: 1.225
+    air_dyn_viscosity: 1.81e-5
+    weib_shape_parameter: 2.
+    air_speed_sound: 340.
+    shear_exp: 0.1
+    water_density: 1025.0
+    water_dyn_viscosity: 1.3351e-3
+    water_depth: 30.0
+    significant_wave_height: 4.52
+    significant_wave_period: 9.45
+    soil_shear_modulus: 140.e+6
+    soil_poisson: 0.4
+    V_mean: 0.0

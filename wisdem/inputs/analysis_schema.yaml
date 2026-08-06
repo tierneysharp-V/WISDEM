@@ -1277,6 +1277,26 @@ properties:
                         default: {}
                         properties:
                             flag: *flag
+                    flare:
+                        type: object
+                        description: >
+                            Jacket batter constraint (r_foot - r_head) / height between lower and upper
+                            bounds (dimensionless slope of each leg in plan radius vs height).
+                        default: {}
+                        properties:
+                            flag: *flag
+                            lower_bound:
+                                type: number
+                                minimum: 0.0
+                                maximum: 1.0
+                                default: 0.1
+                                description: Minimum (r_foot - r_head) / height
+                            upper_bound:
+                                type: number
+                                minimum: 0.0
+                                maximum: 1.0
+                                default: 0.15
+                                description: Maximum (r_foot - r_head) / height
                     height_airgap:
                         type: object
                         description: Ensures jacket height is at least water depth + significant wave height + air gap + safety margin

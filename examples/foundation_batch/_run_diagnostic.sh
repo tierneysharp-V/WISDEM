@@ -11,7 +11,9 @@ run_one() {
   local ecfile="logs/diagnostic_${foundation}.exitcode"
   {
     echo "=== START ${foundation} $(date -Is) ==="
-    python run_foundation_batch.py diagnostic_scenarios.csv --foundation "${foundation}"
+    python run_foundation_batch.py diagnostic_scenarios.csv \
+      --turbine-csv turbine_lookup.csv \
+      --foundation "${foundation}"
     local ec=$?
     echo "=== ${foundation} EXIT ${ec} $(date -Is) ==="
     echo "${ec}" > "${ecfile}"

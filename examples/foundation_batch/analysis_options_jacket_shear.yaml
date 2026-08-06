@@ -11,7 +11,7 @@ design_variables:
         r_head:
             flag: True
             lower_bound: 2.
-            upper_bound: 6.
+            upper_bound: 20.
         leg_thickness:
             flag: True
             # Temporarily widened for shear sensitivity (was 0.05–0.1)

@@ -1,0 +1,4 @@
+# Run-only analysis options for Stage-1 RNA load computation (no optimisation)
+general:
+    folder_output: outputs_loads
+    fname_output: refturb_output

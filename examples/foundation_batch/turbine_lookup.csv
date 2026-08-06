@@ -1,0 +1,3 @@
+parameter,nrel5mw,IEA3.4MW,IEA10MW,IEA15MW,IEA22MW
+_source_yaml,../02_reference_turbines/nrel5mw.yaml,../02_reference_turbines/IEA-3p4-130-RWT.yaml,../02_reference_turbines/IEA-10-198-RWT.yaml,../02_reference_turbines/IEA-15-240-RWT.yaml,../02_reference_turbines/IEA-22-280-RWT.yaml
+assembly.rated_power,5000000,3370000,10000000,15000000,22000000

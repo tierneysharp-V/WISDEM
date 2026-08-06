@@ -92,6 +92,8 @@ class ComputeJacketNodes(om.ExplicitComponent):
         self.add_output("leg_nodes", val=np.zeros((n_legs, n_bays + 2, 3)), units="m")
         self.add_output("bay_nodes", val=np.zeros((n_legs, n_bays + 1, 3)), units="m")
         self.add_output("constr_diam_consistency", val=0.0)
+        # Jacket batter / flare: (r_foot - r_head) / height
+        self.add_output("constr_jacket_flare", val=0.0)
 
     def compute(self, inputs, outputs):
         mod_opt = self.options["modeling_options"]
@@ -119,6 +121,11 @@ class ComputeJacketNodes(om.ExplicitComponent):
             outputs["bay_nodes"][i, :, 2] = z_bay
 
         outputs["constr_diam_consistency"] = inputs["tower_base_diameter"] / r_head
+        h = float(np.asarray(height).flatten()[0])
+        if h > 0.0:
+            outputs["constr_jacket_flare"] = (r_foot - r_head) / h
+        else:
+            outputs["constr_jacket_flare"] = 0.0
 
 
 class JacketHeightAirgapConstraint(om.ExplicitComponent):
