@@ -22,14 +22,14 @@ design_variables:
         layer_thickness:
             flag: True
             uniform: True
-            # Temporarily widened for shear sensitivity (was 0.05–0.2)
+            # Temporarily widened for shear sensitivity; runtime floor (6.35+D_mm/100)/1000 still applied
             lower_bound: 0.005
             upper_bound: 0.5
-        # Height set by conceptual design rules (H_free + 5*D); not a DV
+        # Height fixed by apply_wt_geometry_rules (H_free + L_emb); optimise D/t only
         height:
             flag: False
             lower_bound: 40.0
-            upper_bound: 120.0
+            upper_bound: 150.0
 
 merit_figure: monopile_mass
 
@@ -82,17 +82,13 @@ constraints:
             flag: True
             lower_bound: 0.13
             upper_bound: 0.20
-        # Embedment set by 5*D rule after sizing; do not fight with a fixed floor
+        # Embedment/freeboard height applied post-opt via geometry rules (not opt constraints)
         pile_depth:
             flag: False
-            lower_bound: 20.0
         tower_diameter_coupling:
             flag: True
-        # Freeboard pre-set by conceptual design rules
         height_airgap:
             flag: False
-            air_gap: 1.5
-            safety_margin: 4.0
 
 driver:
     optimization:

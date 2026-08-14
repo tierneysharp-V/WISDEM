@@ -59,8 +59,6 @@ constraints:
         # Freeboard pre-set by conceptual design rules when using foundation_batch
         height_airgap:
             flag: False
-            air_gap: 1.5
-            safety_margin: 4.0
 
 driver:
     optimization:

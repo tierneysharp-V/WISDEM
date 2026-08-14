@@ -13,6 +13,10 @@ import wisdem.pyframe3dd.pyframe3dd as pyframe3dd
 import wisdem.commonse.manufacturing as manu
 import wisdem.commonse.cross_sections as cs
 import wisdem.commonse.utilization_dnvgl as util_dnvgl
+from wisdem.fixed_bottomse.conceptual_design_rules import (
+    HSIG_CLEARANCE_PRIMARY,
+    HSIG_CLEARANCE_SECONDARY,
+)
 import wisdem.commonse.utilization_constraints as util_con
 from wisdem.commonse import NFREQ, RIGID, gravity
 
@@ -132,10 +136,10 @@ class JacketHeightAirgapConstraint(om.ExplicitComponent):
     """
     Clearance metric for jacket height vs site water depth and waves.
 
-    jacket_height_above_wave = height - water_depth - Hsig_wave
+    jacket_height_above_wave = height - water_depth - 1.98*Hsig - 0.2*Hsig
 
-    Constrained in optimization with lower bound = air_gap + safety_margin, i.e.
-    height >= water_depth + Hsig_wave + air_gap + safety_margin.
+    Constrained in optimization with lower bound = 0, i.e.
+    height >= water_depth + 1.98*Hsig + 0.2*Hsig.
     """
 
     def setup(self):
@@ -146,7 +150,10 @@ class JacketHeightAirgapConstraint(om.ExplicitComponent):
 
     def compute(self, inputs, outputs):
         outputs["jacket_height_above_wave"] = (
-            inputs["height"] - inputs["water_depth"] - inputs["Hsig_wave"]
+            inputs["height"]
+            - inputs["water_depth"]
+            - HSIG_CLEARANCE_PRIMARY * inputs["Hsig_wave"]
+            - HSIG_CLEARANCE_SECONDARY * inputs["Hsig_wave"]
         )
 
 

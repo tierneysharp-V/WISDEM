@@ -1,6 +1,12 @@
 import numpy as np
 import openmdao.api as om
 
+from wisdem.fixed_bottomse.conceptual_design_rules import (
+    HSIG_CLEARANCE_PRIMARY,
+    HSIG_CLEARANCE_SECONDARY,
+    embedment_length,
+    monopile_min_wall_thickness,
+)
 import wisdem.commonse.utilities as util
 import wisdem.pyframe3dd.pyframe3dd as pyframe3dd
 import wisdem.commonse.cylinder_member as mem
@@ -84,10 +90,10 @@ class MonopileHeightAirgapConstraint(om.ExplicitComponent):
     """
     Clearance metric for monopile height vs site water depth and waves.
 
-    monopile_height_above_wave = monopile_height - water_depth - Hsig_wave
+    monopile_height_above_wave = monopile_height - water_depth - 1.98*Hsig - 0.2*Hsig
 
-    Constrained in optimization with lower bound = air_gap + safety_margin, i.e.
-    height >= water_depth + Hsig_wave + air_gap + safety_margin.
+    Constrained in optimization with lower bound = 0, i.e.
+    height >= water_depth + 1.98*Hsig + 0.2*Hsig.
     """
 
     def setup(self):
@@ -98,7 +104,78 @@ class MonopileHeightAirgapConstraint(om.ExplicitComponent):
 
     def compute(self, inputs, outputs):
         outputs["monopile_height_above_wave"] = (
-            inputs["monopile_height"] - inputs["water_depth"] - inputs["Hsig_wave"]
+            inputs["monopile_height"]
+            - inputs["water_depth"]
+            - HSIG_CLEARANCE_PRIMARY * inputs["Hsig_wave"]
+            - HSIG_CLEARANCE_SECONDARY * inputs["Hsig_wave"]
+        )
+
+
+class MinEmbedmentLength(om.ExplicitComponent):
+    """
+    Minimum pile embedment below mudline from the conceptual design rule.
+
+    L_emb,min = D * (Ee/G*)^(2/7), using mudline diameter, wall thickness, and steel E.
+    """
+
+    def setup(self):
+        self.add_input("diameter", val=0.0, units="m")
+        self.add_input("thickness", val=0.0, units="m")
+        self.add_input("youngs_modulus", val=0.0, units="Pa")
+        self.add_input("G_soil", val=0.0, units="Pa")
+        self.add_input("nu_soil", val=0.0)
+        self.add_output("min_embedment_length", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["min_embedment_length"] = embedment_length(
+            float(np.atleast_1d(inputs["diameter"])[0]),
+            float(np.atleast_1d(inputs["thickness"])[0]),
+            float(np.atleast_1d(inputs["youngs_modulus"])[0]),
+            float(np.atleast_1d(inputs["G_soil"])[0]),
+            float(np.atleast_1d(inputs["nu_soil"])[0]),
+        )
+
+
+class EmbedmentMarginConstraint(om.ExplicitComponent):
+    """Embedment margin = suctionpile_depth - L_emb,min (constrain >= 0)."""
+
+    def setup(self):
+        self.add_input("suctionpile_depth", val=0.0, units="m")
+        self.add_input("min_embedment_length", val=0.0, units="m")
+        self.add_output("constr_embedment_margin", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["constr_embedment_margin"] = (
+            inputs["suctionpile_depth"] - inputs["min_embedment_length"]
+        )
+
+
+class MinWallThickness(om.ExplicitComponent):
+    """
+    Minimum monopile wall thickness from t >= D/120 (mudline diameter).
+    """
+
+    def setup(self):
+        self.add_input("diameter", val=0.0, units="m")
+        self.add_output("min_wall_thickness", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["min_wall_thickness"] = monopile_min_wall_thickness(
+            float(np.atleast_1d(inputs["diameter"])[0])
+        )
+
+
+class WallThicknessMarginConstraint(om.ExplicitComponent):
+    """Wall thickness margin = t - t_min (constrain >= 0)."""
+
+    def setup(self):
+        self.add_input("thickness", val=0.0, units="m")
+        self.add_input("min_wall_thickness", val=0.0, units="m")
+        self.add_output("constr_wall_thickness_margin", val=0.0, units="m")
+
+    def compute(self, inputs, outputs):
+        outputs["constr_wall_thickness_margin"] = (
+            inputs["thickness"] - inputs["min_wall_thickness"]
         )
 
 
@@ -852,6 +929,34 @@ class MonopileSEProp(om.Group):
         self.connect("member.shell_cost", "mono.cylinder_cost")
         self.connect("member.shell_z_cg", "mono.cylinder_z_cg")
         self.connect("member.shell_I_base", "mono.cylinder_I_base")
+
+        self.add_subsystem(
+            "min_embedment",
+            MinEmbedmentLength(),
+            promotes_inputs=[("G_soil", "G_soil"), ("nu_soil", "nu_soil")],
+        )
+        self.connect("monopile_outer_diameter", "min_embedment.diameter", src_indices=[0])
+        self.connect("monopile_wall_thickness", "min_embedment.thickness", src_indices=[0])
+        self.connect("section_E", "min_embedment.youngs_modulus", src_indices=[0])
+
+        self.add_subsystem(
+            "embedment_margin",
+            EmbedmentMarginConstraint(),
+            promotes_inputs=["suctionpile_depth"],
+            promotes_outputs=["constr_embedment_margin"],
+        )
+        self.connect("min_embedment.min_embedment_length", "embedment_margin.min_embedment_length")
+
+        self.add_subsystem("min_wall_t", MinWallThickness())
+        self.connect("monopile_outer_diameter", "min_wall_t.diameter", src_indices=[0])
+
+        self.add_subsystem(
+            "wall_t_margin",
+            WallThicknessMarginConstraint(),
+            promotes_outputs=["constr_wall_thickness_margin"],
+        )
+        self.connect("monopile_wall_thickness", "wall_t_margin.thickness", src_indices=[0])
+        self.connect("min_wall_t.min_wall_thickness", "wall_t_margin.min_wall_thickness")
 
         if mod_opt["soil_springs"]:
             self.add_subsystem(

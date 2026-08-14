@@ -1168,17 +1168,19 @@ class PoseOptimization(object):
             )
 
         if monopile_constr["pile_depth"]["flag"]:
-            wt_opt.model.add_constraint("fixedse.suctionpile_depth", lower=monopile_constr["pile_depth"]["lower_bound"])
+            wt_opt.model.add_constraint("fixedse.constr_embedment_margin", lower=0.0)
+
+        if monopile_constr.get("wall_thickness_min", {}).get("flag", False):
+            wt_opt.model.add_constraint("fixedse.constr_wall_thickness_margin", lower=0.0)
 
         if monopile_constr["tower_diameter_coupling"]["flag"]:
             wt_opt.model.add_constraint("fixedse.constr_diam_consistency", upper=1.0)
 
         if monopile_constr["height_airgap"]["flag"]:
-            # height >= water_depth + Hsig_wave + air_gap + safety_margin
-            ha = monopile_constr["height_airgap"]
+            # height >= water_depth + 1.98*Hsig + 0.2*Hsig
             wt_opt.model.add_constraint(
                 "fixedse.monopile_height_above_wave",
-                lower=ha["air_gap"] + ha["safety_margin"],
+                lower=0.0,
             )
 
         if monopile_constr["mass"]["flag"]:
@@ -1220,11 +1222,10 @@ class PoseOptimization(object):
             )
 
         if jacket_constr["height_airgap"]["flag"]:
-            # height >= water_depth + Hsig_wave + air_gap + safety_margin
-            ha = jacket_constr["height_airgap"]
+            # height >= water_depth + 1.98*Hsig + 0.2*Hsig
             wt_opt.model.add_constraint(
                 "fixedse.jacket_height_above_wave",
-                lower=ha["air_gap"] + ha["safety_margin"],
+                lower=0.0,
             )
 
         # Hub and drivetrain constraints

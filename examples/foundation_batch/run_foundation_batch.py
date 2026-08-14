@@ -763,12 +763,20 @@ def monopile_diameter_floor(wt_geom: dict) -> float:
     return float(max(_D_LO, tower_base_diameter_from_geom(wt_geom)))
 
 
+def monopile_thickness_floor(diameter_m: float) -> float:
+    """Minimum wall thickness [m]: t >= D/120 (see conceptual_design_rules)."""
+    from wisdem.fixed_bottomse.conceptual_design_rules import monopile_min_wall_thickness
+
+    return monopile_min_wall_thickness(diameter_m)
+
+
 def seed_monopile_diameter_thickness(wt_geom: dict, diameter: float, thickness: float) -> dict:
     """Overwrite monopile outer diameter and wall thickness (uniform). Enforces D >= tower base."""
     wt = copy.deepcopy(wt_geom)
     d_floor = monopile_diameter_floor(wt)
     d = _clip(max(float(diameter), d_floor), _D_LO, _D_HI)
-    t = _clip(float(thickness), _T_LO, _T_HI)
+    t_floor = monopile_thickness_floor(d)
+    t = _clip(max(float(thickness), t_floor), max(_T_LO, t_floor), _T_HI)
     mono = wt["components"]["monopile"]
     n_d = len(mono["outer_shape"]["outer_diameter"]["values"])
     mono["outer_shape"]["outer_diameter"]["values"] = [d] * n_d
@@ -907,7 +915,7 @@ def scale_monopile_cold_start(wt_geom: dict) -> dict:
         )
     except Exception:
         t0 = _T_LO
-    t = _clip(max(t0, 0.008 * d), _T_LO, _T_HI)
+    t = _clip(max(t0, monopile_thickness_floor(d)), monopile_thickness_floor(d), _T_HI)
     print(
         f"  Cold-start monopile from D_tower={d_tow:.3f} m: "
         f"D={d:.3f} m, t={t*1e3:.1f} mm"
@@ -940,6 +948,84 @@ def patch_monopile_diameter_bounds(analysis: dict, wt_geom: dict) -> dict:
     return opts
 
 
+def patch_monopile_thickness_bounds(analysis: dict, wt_geom: dict) -> dict:
+    """Raise monopile layer_thickness DV lower_bound to D/120 at D floor."""
+    opts = copy.deepcopy(analysis)
+    lt = (
+        opts.setdefault("design_variables", {})
+        .setdefault("monopile", {})
+        .setdefault("layer_thickness", {})
+    )
+    if not lt.get("flag", False):
+        return opts
+
+    od = opts["design_variables"]["monopile"].get("outer_diameter", {})
+    d_ref = float(od.get("lower_bound", monopile_diameter_floor(wt_geom)))
+    t_floor = monopile_thickness_floor(d_ref)
+    lo = float(lt.get("lower_bound", _T_LO))
+    hi = float(lt.get("upper_bound", _T_HI))
+    new_lo = max(lo, t_floor)
+    if new_lo > hi:
+        raise ValueError(
+            f"Monopile t floor {new_lo:.6f} m (D={d_ref:.3f} m) exceeds "
+            f"DV upper_bound {hi:.6f} m"
+        )
+    lt["lower_bound"] = new_lo
+
+    mono_c = opts.setdefault("constraints", {}).setdefault("monopile", {})
+    mono_c.setdefault("wall_thickness_min", {})["flag"] = True
+
+    print(
+        f"  Monopile t DV bounds: lower={new_lo:.6f} m "
+        f"(D/120 at D={d_ref:.3f} m), upper={hi:.6f} m"
+    )
+    return opts
+
+
+def monopile_height_dv_enabled(analysis: dict) -> bool:
+    """True when monopile total height is an optimization design variable."""
+    return bool(
+        analysis.get("design_variables", {})
+        .get("monopile", {})
+        .get("height", {})
+        .get("flag", False)
+    )
+
+
+def patch_monopile_height_bounds(
+    analysis: dict, wt_geom: dict, modeling: dict, cdr
+) -> dict:
+    """Set height DV lower bound to H_free + L_emb,min; ensure min constraints are on."""
+    opts = copy.deepcopy(analysis)
+    mono_h = (
+        opts.setdefault("design_variables", {})
+        .setdefault("monopile", {})
+        .setdefault("height", {})
+    )
+    if not mono_h.get("flag", False):
+        return opts
+
+    site = cdr.resolve_site_params(modeling)
+    l_emb_min = cdr.embedment_length_from_wt(wt_geom, modeling)
+    h_min = site["H_free"] + l_emb_min
+    hi = float(mono_h.get("upper_bound", 150.0))
+    if h_min > hi:
+        raise ValueError(
+            f"Monopile height minimum {h_min:.3f} m exceeds DV upper_bound {hi:.3f} m"
+        )
+    mono_h["lower_bound"] = h_min
+
+    mono_c = opts.setdefault("constraints", {}).setdefault("monopile", {})
+    mono_c.setdefault("height_airgap", {})["flag"] = True
+    mono_c.setdefault("pile_depth", {})["flag"] = True
+
+    print(
+        f"  Monopile height DV: lower={h_min:.3f} m "
+        f"(H_free={site['H_free']:.3f} + L_emb,min={l_emb_min:.3f}), upper={hi:.3f} m"
+    )
+    return opts
+
+
 def extract_monopile_dt(wt_opt) -> tuple[float, float]:
     """Return (diameter_m, thickness_m) from an optimised problem."""
     diam = _as_float_list(wt_opt.get_val("monopile.diameter", units="m"))
@@ -952,8 +1038,15 @@ def extract_monopile_dt(wt_opt) -> tuple[float, float]:
     return d, t
 
 
-def write_optimised_monopile_geometry(wt_geom: dict, wt_opt, modeling: dict, cdr) -> dict:
-    """After sizing, set L_emb = 5 * D_opt and copy optimised D/t into geometry."""
+def write_optimised_monopile_geometry(
+    wt_geom: dict,
+    wt_opt,
+    modeling: dict,
+    cdr,
+    *,
+    use_opt_embedment: bool = False,
+) -> dict:
+    """Copy optimised D/t (and embedment) into geometry YAML."""
     wt = copy.deepcopy(wt_geom)
     mono = wt["components"]["monopile"]
     d_floor = monopile_diameter_floor(wt)
@@ -984,9 +1077,21 @@ def write_optimised_monopile_geometry(wt_geom: dict, wt_opt, modeling: dict, cdr
         pass
 
     d_mud = float(diam_vals[0])
-    l_emb = cdr.embedment_length(d_mud)
+    t_floor = monopile_thickness_floor(d_mud)
+    t_vals = [
+        max(t_floor, float(x))
+        for x in mono["structure"]["layers"][0]["thickness"]["values"]
+    ]
+    mono["structure"]["layers"][0]["thickness"]["values"] = t_vals
+    t_mud = float(t_vals[0])
+    if use_opt_embedment:
+        l_emb = float(
+            np.atleast_1d(wt_opt.get_val("fixedse.suctionpile_depth", units="m")).flatten()[0]
+        )
+    else:
+        l_emb = cdr.embedment_length_from_wt(wt, modeling, diameter=d_mud, thickness=t_mud)
     site = cdr.resolve_site_params(modeling)
-    print(f"  Post-opt embedment: L_emb = 5 * {d_mud:.4f} m = {l_emb:.4f} m")
+    print(f"  Post-opt embedment: L_emb = {l_emb:.4f} m (D={d_mud:.4f} m, t={t_mud:.4f} m)")
     print(f"  H_free = {site['H_free']:.4f} m; total height = {site['H_free'] + l_emb:.4f} m")
 
     return cdr.apply_wt_geometry_rules(wt, modeling, "monopile", embedment=l_emb)
@@ -1219,7 +1324,6 @@ def repair_feasible_monopile_start(
             seed_monopile_diameter_thickness(wt, d, t),
             modeling,
             "monopile",
-            embedment=cdr.embedment_length(d),
         )
         geom_path = os.path.join(TMP_DIR, f"geometry_{tag}_preflight_{i}.yaml")
         dump_yaml(wt, geom_path)
@@ -1264,8 +1368,9 @@ def run_monopile_two_stage(
 ) -> tuple:
     """
     Preflight feasible seed -> Stage 1 (full, shorter) -> Stage 2 polish ->
-    5*D embedment refresh. Returns (wt_opt, modeling_options, opt_exit_mode, d, t).
+    embedment refresh. Returns (wt_opt, modeling_options, opt_exit_mode, d, t).
     """
+    height_opt = monopile_height_dv_enabled(analysis)
     print("  Preflight feasible-start repair …")
     wt_geom = repair_feasible_monopile_start(
         run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr, f_lo, f_hi
@@ -1286,14 +1391,13 @@ def run_monopile_two_stage(
     print_monopile_diagnostics(wt_opt, "stage1", exit_mode=exit1)
 
     d1, t1 = extract_monopile_dt(wt_opt)
-    wt_after_s1 = seed_monopile_diameter_thickness(wt_geom, d1, t1)
-    d1 = float(wt_after_s1["components"]["monopile"]["outer_shape"]["outer_diameter"]["values"][0])
-    t1 = float(
-        wt_after_s1["components"]["monopile"]["structure"]["layers"][0]["thickness"]["values"][0]
-    )
-    wt_after_s1 = cdr.apply_wt_geometry_rules(
-        wt_after_s1, modeling, "monopile", embedment=cdr.embedment_length(d1)
-    )
+    if height_opt:
+        wt_after_s1 = write_optimised_monopile_geometry(
+            wt_geom, wt_opt, modeling, cdr, use_opt_embedment=True
+        )
+    else:
+        wt_after_s1 = seed_monopile_diameter_thickness(wt_geom, d1, t1)
+        wt_after_s1 = cdr.apply_wt_geometry_rules(wt_after_s1, modeling, "monopile")
 
     analysis_s2 = analysis_stage2_full(analysis)
     analysis_s2.setdefault("general", {})
@@ -1311,14 +1415,19 @@ def run_monopile_two_stage(
 
     d2, t2 = extract_monopile_dt(wt_opt)
     d2 = max(d2, monopile_diameter_floor(wt_geom))
-    t2 = _clip(t2, _T_LO, _T_HI)
+    t2 = _clip(t2, monopile_thickness_floor(d2), _T_HI)
 
-    wt_final = write_optimised_monopile_geometry(wt_after_s1, wt_opt, modeling, cdr)
+    wt_final = write_optimised_monopile_geometry(
+        wt_after_s1, wt_opt, modeling, cdr, use_opt_embedment=height_opt
+    )
     wt_refresh = os.path.join(TMP_DIR, f"geometry_{tag}_embedment.yaml")
     analysis_refresh = os.path.join(TMP_DIR, f"analysis_{tag}_refresh.yaml")
     dump_yaml(wt_final, wt_refresh)
     dump_yaml(analysis_refresh_options(analysis_s2), analysis_refresh)
-    print("  Refreshing analysis with final 5*D embedment …")
+    if height_opt:
+        print("  Refreshing analysis with optimised height/embedment …")
+    else:
+        print("  Refreshing analysis with final embedment …")
     wt_opt, modeling_options, _opt = run_wisdem(
         wt_refresh, modeling_out, analysis_refresh, run_only=True
     )
@@ -1746,17 +1855,10 @@ def run_batch(
                     d_ws = max(d_ws, monopile_diameter_floor(wt_geom))
                     print(f"  Warm-start from previous soil case: D={d_ws:.4f} m, t={t_ws*1e3:.2f} mm")
                     wt_geom = seed_monopile_diameter_thickness(wt_geom, d_ws, t_ws)
-                    wt_geom = cdr.apply_wt_geometry_rules(
-                        wt_geom, modeling, "monopile", embedment=cdr.embedment_length(d_ws)
-                    )
+                    wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
                 elif ftype == "monopile":
                     wt_geom = scale_monopile_cold_start(wt_geom)
-                    d0 = float(
-                        wt_geom["components"]["monopile"]["outer_shape"]["outer_diameter"]["values"][0]
-                    )
-                    wt_geom = cdr.apply_wt_geometry_rules(
-                        wt_geom, modeling, "monopile", embedment=cdr.embedment_length(d0)
-                    )
+                    wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
                 elif ftype == "jacket" and ws_key in jacket_warmstart:
                     r_h, ratio, leg_d, leg_t, brace_d, brace_t = jacket_warmstart[ws_key]
                     print(
@@ -1771,6 +1873,7 @@ def run_batch(
 
                 if ftype == "monopile":
                     analysis = patch_monopile_diameter_bounds(analysis, wt_geom)
+                    analysis = patch_monopile_thickness_bounds(analysis, wt_geom)
 
                 wt_out = os.path.join(TMP_DIR, f"geometry_{tag}.yaml")
                 dump_yaml(wt_geom, wt_out)

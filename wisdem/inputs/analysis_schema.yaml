@@ -1221,7 +1221,7 @@ properties:
                     mass: *mass_constr
                     pile_depth:
                         type: object
-                        description: Ensures that the submerged suction pile depth meets a minimum value
+                        description: Ensures pile embedment below mudline meets L_emb,min = D*(Ee/G*)^(2/7) using mudline D/t and site soil properties
                         default: {}
                         properties:
                             flag: *flag
@@ -1231,6 +1231,7 @@ properties:
                                 maximum: 200.0
                                 default: 0.0
                                 unit: m
+                                description: Deprecated; embedment minimum is computed from the conceptual design rule when flag is True
                     tower_diameter_coupling:
                         type: object
                         description: Ensures that the top diameter of the monopile is the same or larger than the base diameter of the tower
@@ -1239,24 +1240,16 @@ properties:
                             flag: *flag
                     height_airgap:
                         type: object
-                        description: Ensures monopile height is at least water depth + significant wave height + air gap + safety margin
+                        description: Ensures monopile height is at least water_depth + 1.98*significant wave height + 0.2*significant wave height
                         default: {}
                         properties:
                             flag: *flag
-                            air_gap:
-                                type: number
-                                minimum: 0.0
-                                maximum: 50.0
-                                default: 1.5
-                                unit: m
-                                description: Required clearance above MSL + 50-year significant wave height
-                            safety_margin:
-                                type: number
-                                minimum: 0.0
-                                maximum: 50.0
-                                default: 4.0
-                                unit: m
-                                description: Additional safety margin added on top of air gap for monopile height
+                    wall_thickness_min:
+                        type: object
+                        description: Ensures monopile wall thickness satisfies t_mm >= 6.35 + D_mm/100 at the mudline station
+                        default: {}
+                        properties:
+                            flag: *flag
             jacket:
                 type: object
                 default: {}
@@ -1299,24 +1292,10 @@ properties:
                                 description: Maximum (r_foot - r_head) / height
                     height_airgap:
                         type: object
-                        description: Ensures jacket height is at least water depth + significant wave height + air gap + safety margin
+                        description: Ensures jacket height is at least water_depth + 1.98*significant wave height + 0.2*significant wave height
                         default: {}
                         properties:
                             flag: *flag
-                            air_gap:
-                                type: number
-                                minimum: 0.0
-                                maximum: 50.0
-                                default: 1.5
-                                unit: m
-                                description: Required clearance of jacket top above MSL + 50-year significant wave height
-                            safety_margin:
-                                type: number
-                                minimum: 0.0
-                                maximum: 50.0
-                                default: 4.0
-                                unit: m
-                                description: Additional safety margin added on top of air gap for jacket height
 
             hub:
                 type: object

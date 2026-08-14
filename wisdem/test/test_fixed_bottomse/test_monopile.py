@@ -57,6 +57,58 @@ class TestPreDiscretization(unittest.TestCase):
         self.assertEqual(outputs["constr_diam_consistency"], 0.5)
 
 
+class TestEmbedmentConstraints(unittest.TestCase):
+    def test_min_embedment_length(self):
+        comp = mon.MinEmbedmentLength()
+        prob = om.Problem()
+        prob.model.add_subsystem("min_emb", comp)
+        prob.setup()
+        prob.set_val("min_emb.diameter", 8.0, units="m")
+        prob.set_val("min_emb.thickness", 0.055, units="m")
+        prob.set_val("min_emb.youngs_modulus", 200.0e9, units="Pa")
+        prob.set_val("min_emb.G_soil", 140.0e6, units="Pa")
+        prob.set_val("min_emb.nu_soil", 0.4)
+        prob.run_model()
+        l_min = prob.get_val("min_emb.min_embedment_length", units="m")[0]
+        self.assertGreater(l_min, 0.0)
+        self.assertLess(l_min, 8.0 * 5.0)
+
+    def test_embedment_margin(self):
+        comp = mon.EmbedmentMarginConstraint()
+        prob = om.Problem()
+        prob.model.add_subsystem("margin", comp)
+        prob.setup()
+        prob.set_val("margin.suctionpile_depth", 25.0, units="m")
+        prob.set_val("margin.min_embedment_length", 20.0, units="m")
+        prob.run_model()
+        self.assertAlmostEqual(prob.get_val("margin.constr_embedment_margin", units="m")[0], 5.0)
+
+
+class TestWallThicknessConstraints(unittest.TestCase):
+    def test_min_wall_thickness(self):
+        comp = mon.MinWallThickness()
+        prob = om.Problem()
+        prob.model.add_subsystem("min_t", comp)
+        prob.setup()
+        prob.set_val("min_t.diameter", 10.0, units="m")
+        prob.run_model()
+        t_min = prob.get_val("min_t.min_wall_thickness", units="m")[0]
+        self.assertAlmostEqual(t_min, 10.0 / 120.0)
+
+    def test_wall_thickness_margin(self):
+        comp = mon.WallThicknessMarginConstraint()
+        prob = om.Problem()
+        prob.model.add_subsystem("margin", comp)
+        prob.setup()
+        t_min = 10.0 / 120.0
+        prob.set_val("margin.thickness", 0.12, units="m")
+        prob.set_val("margin.min_wall_thickness", t_min, units="m")
+        prob.run_model()
+        self.assertAlmostEqual(
+            prob.get_val("margin.constr_wall_thickness_margin", units="m")[0], 0.12 - t_min, places=5
+        )
+
+
 class TestMass(unittest.TestCase):
     def testAll(self):
         inputs = {}

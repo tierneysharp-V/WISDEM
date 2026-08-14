@@ -7,8 +7,11 @@ intentionally simple and isolated so thresholds can be changed later without
 touching Frame3DD or PoseOptimization.
 
 Engineering rules (conceptual design):
-  H_free = water_depth + Hs + air_gap + safety_margin
-  L_embedment = EMBEDMENT_DIAMETER_FACTOR * D_opt   (monopile, after sizing)
+  H_free = water_depth + 1.98*Hs + 0.2*Hs
+  L_embedment = D * (Ee/G*)^(2/7)   (monopile, after sizing; D,t at mudline)
+    Ee = E_steel * [1 - ((D - 2t)/D)^4]
+    G* = G_soil * (1 + 3/4 * nu_soil)
+  t_min = D / 120   (monopile wall thickness [m], D in m)
   n_bays from jacket freeboard height thresholds
   equal bay spacing from n_bays
   jackets use four legs
@@ -25,33 +28,122 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Tunable conceptual-design constants (edit here if rules change)
 # ---------------------------------------------------------------------------
-DEFAULT_AIR_GAP_M = 1.5
-DEFAULT_SAFETY_MARGIN_M = 4.0
-EMBEDMENT_DIAMETER_FACTOR = 5.0
+HSIG_CLEARANCE_PRIMARY = 1.98
+HSIG_CLEARANCE_SECONDARY = 0.2
+DEFAULT_SOIL_SHEAR_MODULUS_PA = 140.0e6
+DEFAULT_SOIL_POISSON = 0.4
+MONOPILE_WALL_T_D_TO_T_RATIO = 120.0  # t >= D / ratio
 N_LEGS_JACKET = 4
 
 # Jacket freeboard height [m] → number of bays
 BAY_HEIGHT_THRESHOLDS_M = (50.0, 80.0)  # <50 → 3; 50–80 → 4; >80 → 5
 
 
-def required_freeboard_height(
-    water_depth: float,
-    hs: float,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
-) -> float:
+def wave_clearance_above_mwl(hs: float) -> float:
+    """Transition elevation above MSL from significant wave height."""
+    h = float(hs)
+    return HSIG_CLEARANCE_PRIMARY * h + HSIG_CLEARANCE_SECONDARY * h
+
+
+def required_freeboard_height(water_depth: float, hs: float) -> float:
     """
     Mudline-to-top freeboard height (jacket height; monopile span above seabed).
 
-    Matches the WISDEM height_airgap constraint equality case:
-        height = water_depth + Hs + air_gap + safety_margin
+    Matches the WISDEM height_airgap constraint:
+        height >= water_depth + 1.98*Hs + 0.2*Hs
     """
-    return float(water_depth) + float(hs) + float(air_gap) + float(safety_margin)
+    return float(water_depth) + wave_clearance_above_mwl(hs)
 
 
-def embedment_length(diameter: float, factor: float = EMBEDMENT_DIAMETER_FACTOR) -> float:
-    """Monopile pile embedment below mudline: factor × outer diameter."""
-    return float(factor) * float(diameter)
+def effective_pile_modulus(diameter: float, thickness: float, youngs_modulus: float) -> float:
+    """
+    Effective pile Young's modulus Ee for the embedment rule.
+
+    Ee = E_steel * [J_outer - J_inner] / J_outer with J = D^4 * pi / 64.
+    """
+    d = float(diameter)
+    t = float(thickness)
+    e = float(youngs_modulus)
+    if d <= 0.0:
+        raise ValueError(f"diameter must be > 0, got {d}")
+    if d <= 2.0 * t:
+        raise ValueError(f"diameter must exceed 2*thickness, got D={d}, t={t}")
+    ratio = (d - 2.0 * t) / d
+    return e * (1.0 - ratio**4)
+
+
+def effective_soil_shear_modulus(g_soil: float, nu_soil: float) -> float:
+    """Effective soil shear modulus G* = G_soil * (1 + 3/4 * nu_soil)."""
+    return float(g_soil) * (1.0 + 0.75 * float(nu_soil))
+
+
+def embedment_length(
+    diameter: float,
+    thickness: float,
+    youngs_modulus: float,
+    g_soil: float,
+    nu_soil: float,
+) -> float:
+    """
+    Minimum monopile embedment below mudline: D * (Ee/G*)^(2/7).
+
+    D and t are outer diameter and wall thickness at the mudline station.
+    """
+    d = float(diameter)
+    ee = effective_pile_modulus(d, thickness, youngs_modulus)
+    g_star = effective_soil_shear_modulus(g_soil, nu_soil)
+    if g_star <= 0.0:
+        raise ValueError(f"effective soil shear modulus G* must be > 0, got {g_star}")
+    stiffness_ratio = ee / g_star
+    if stiffness_ratio <= 0.0:
+        raise ValueError(f"Ee/G* must be > 0, got {stiffness_ratio}")
+    return d * stiffness_ratio ** (2.0 / 7.0)
+
+
+def mudline_thickness_from_geometry(monopile: dict[str, Any]) -> float:
+    """Representative wall thickness for embedment rule (mudline / first station)."""
+    values = monopile["structure"]["layers"][0]["thickness"]["values"]
+    return float(np.atleast_1d(np.asarray(values, dtype=float)).flatten()[0])
+
+
+def monopile_min_wall_thickness(diameter_m: float) -> float:
+    """
+    Minimum monopile wall thickness [m] from t >= D/120.
+
+    With outer diameter D in meters: t_m = D / MONOPILE_WALL_T_D_TO_T_RATIO.
+    """
+    d = float(diameter_m)
+    if d <= 0.0:
+        raise ValueError(f"diameter must be > 0, got {d}")
+    return d / MONOPILE_WALL_T_D_TO_T_RATIO
+
+
+def monopile_youngs_modulus(wt: dict[str, Any]) -> float:
+    """Young's modulus of the monopile steel layer from the windIO materials list."""
+    mono = wt["components"]["monopile"]
+    mat_name = mono["structure"]["layers"][0]["material"]
+    for mat in wt.get("materials", []):
+        if mat.get("name") == mat_name:
+            return float(mat["E"])
+    raise ValueError(f"Material '{mat_name}' not found in wt['materials']")
+
+
+def embedment_length_from_wt(
+    wt: dict[str, Any],
+    modeling_options: dict[str, Any],
+    *,
+    diameter: float | None = None,
+    thickness: float | None = None,
+) -> float:
+    """Compute mudline embedment from geometry, materials, and site soil properties."""
+    mono = wt["components"]["monopile"]
+    d = float(diameter) if diameter is not None else mudline_diameter_from_geometry(mono)
+    t = float(thickness) if thickness is not None else mudline_thickness_from_geometry(mono)
+    e_steel = monopile_youngs_modulus(wt)
+    env = modeling_options.get("Environment", {})
+    g_soil = float(env.get("soil_shear_modulus", DEFAULT_SOIL_SHEAR_MODULUS_PA))
+    nu_soil = float(env.get("soil_poisson", DEFAULT_SOIL_POISSON))
+    return embedment_length(d, t, e_steel, g_soil, nu_soil)
 
 
 def n_bays_from_height(freeboard_height: float) -> int:
@@ -80,13 +172,9 @@ def equal_bay_spacing(n_bays: int) -> list[float]:
     return np.linspace(0.5 / (n + 1), 1.0 - 0.5 / (n + 1), n + 1).tolist()
 
 
-def monopile_z_top(
-    hs: float,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
-) -> float:
+def monopile_z_top(hs: float) -> float:
     """Transition-piece elevation above mean water line."""
-    return float(hs) + float(air_gap) + float(safety_margin)
+    return wave_clearance_above_mwl(hs)
 
 
 def monopile_total_height(freeboard_height: float, embedment: float) -> float:
@@ -99,19 +187,17 @@ def monopile_reference_z(
     hs: float,
     embedment: float,
     s_grid: list[float] | np.ndarray,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
 ) -> list[float]:
     """
     Rebuild monopile reference-axis z values on an existing nondimensional grid.
 
     z(s) = z_top - height_in * (1 - s), with
-      z_top = Hs + air_gap + safety_margin
+      z_top = 1.98*Hs + 0.2*Hs
       height_in = H_free + embedment
-      H_free = water_depth + Hs + air_gap + safety_margin
+      H_free = water_depth + 1.98*Hs + 0.2*Hs
     """
-    h_free = required_freeboard_height(water_depth, hs, air_gap, safety_margin)
-    z_top = monopile_z_top(hs, air_gap, safety_margin)
+    h_free = required_freeboard_height(water_depth, hs)
+    z_top = monopile_z_top(hs)
     height_in = monopile_total_height(h_free, embedment)
     s = np.asarray(s_grid, dtype=float).flatten()
     z = z_top - height_in * (1.0 - s)
@@ -172,8 +258,6 @@ def ensure_mudline_station(
     water_depth: float,
     hs: float,
     embedment: float,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
 ) -> list[float]:
     """
     Ensure the nondimensional grid has a mudline station for soil-spring Frame3DD.
@@ -183,7 +267,7 @@ def ensure_mudline_station(
     is enabled, so insert s_mud = L_emb / (H_free + L_emb) when missing.
     Waterline is optional; keep an existing mid-water station if already present.
     """
-    h_free = required_freeboard_height(water_depth, hs, air_gap, safety_margin)
+    h_free = required_freeboard_height(water_depth, hs)
     height_in = monopile_total_height(h_free, embedment)
     if height_in <= 0.0:
         raise ValueError(f"monopile height_in must be > 0, got {height_in}")
@@ -233,27 +317,34 @@ def apply_monopile_geometry(
     water_depth: float,
     hs: float,
     embedment: float | None = None,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
+    youngs_modulus: float | None = None,
+    g_soil: float | None = None,
+    nu_soil: float | None = None,
 ) -> dict[str, Any]:
     """
     Rebuild monopile reference-axis z from freeboard rule + embedment.
 
-    If embedment is None, use provisional L_emb = factor × current mudline diameter.
+    If embedment is None, use L_emb = D*(Ee/G*)^(2/7) from mudline D/t, steel E, and site soil.
     Inserts a mudline grid station when needed so soil_springs Frame3DD sees
     exactly one submerged-pile section (tip → mudline).
     """
     monopile = dict(monopile)
     if embedment is None:
-        embedment = embedment_length(mudline_diameter_from_geometry(monopile))
+        if youngs_modulus is None or g_soil is None or nu_soil is None:
+            raise ValueError(
+                "embedment or (youngs_modulus, g_soil, nu_soil) required to compute embedment length"
+            )
+        embedment = embedment_length(
+            mudline_diameter_from_geometry(monopile),
+            mudline_thickness_from_geometry(monopile),
+            youngs_modulus,
+            g_soil,
+            nu_soil,
+        )
 
-    s_grid = ensure_mudline_station(
-        monopile, water_depth, hs, embedment, air_gap=air_gap, safety_margin=safety_margin
-    )
+    s_grid = ensure_mudline_station(monopile, water_depth, hs, embedment)
     z_axis = monopile.setdefault("reference_axis", {}).setdefault("z", {})
-    z_axis["values"] = monopile_reference_z(
-        water_depth, hs, embedment, s_grid, air_gap=air_gap, safety_margin=safety_margin
-    )
+    z_axis["values"] = monopile_reference_z(water_depth, hs, embedment, s_grid)
     return monopile
 
 
@@ -279,8 +370,6 @@ def apply_wt_geometry_rules(
     modeling_options: dict[str, Any],
     foundation_type: str,
     embedment: float | None = None,
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
 ) -> dict[str, Any]:
     """
     Apply conceptual topology/height rules to a windIO geometry dict.
@@ -288,24 +377,25 @@ def apply_wt_geometry_rules(
     foundation_type: 'jacket' or 'monopile'
     """
     wt = copy_wt_components(wt)
-    site = resolve_site_params(modeling_options, air_gap=air_gap, safety_margin=safety_margin)
+    site = resolve_site_params(modeling_options)
     comps = wt.setdefault("components", {})
 
     if foundation_type == "jacket":
         comps["jacket"] = apply_jacket_topology(comps["jacket"], site["H_free"])
         # Align tower base with jacket top (mudline at 0 for jackets in examples is different;
         # jacket height is freeboard; tower typically starts at jacket top above MWL).
-        # Jacket top elevation above MWL = H_free - water_depth = Hs + air_gap + safety_margin.
+        # Jacket top elevation above MWL = H_free - water_depth = 1.98*Hs + 0.2*Hs.
         if "tower" in comps:
             comps["tower"] = shift_tower_to_transition(comps["tower"], site["z_top"])
     elif foundation_type == "monopile":
+        mono_embedment = embedment
+        if mono_embedment is None:
+            mono_embedment = embedment_length_from_wt(wt, modeling_options)
         comps["monopile"] = apply_monopile_geometry(
             comps["monopile"],
             site["water_depth"],
             site["hs"],
-            embedment=embedment,
-            air_gap=air_gap,
-            safety_margin=safety_margin,
+            embedment=mono_embedment,
         )
         if "tower" in comps:
             comps["tower"] = shift_tower_to_transition(comps["tower"], site["z_top"])
@@ -320,21 +410,15 @@ def copy_wt_components(wt: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(wt)
 
 
-def resolve_site_params(
-    modeling_options: dict[str, Any],
-    air_gap: float = DEFAULT_AIR_GAP_M,
-    safety_margin: float = DEFAULT_SAFETY_MARGIN_M,
-) -> dict[str, float]:
+def resolve_site_params(modeling_options: dict[str, Any]) -> dict[str, float]:
     """Pull water depth / Hs from modeling Environment and compute H_free."""
     env = modeling_options.get("Environment", {})
     water_depth = float(env.get("water_depth", 0.0))
     hs = float(env.get("significant_wave_height", 0.0))
-    h_free = required_freeboard_height(water_depth, hs, air_gap, safety_margin)
+    h_free = required_freeboard_height(water_depth, hs)
     return {
         "water_depth": water_depth,
         "hs": hs,
-        "air_gap": float(air_gap),
-        "safety_margin": float(safety_margin),
         "H_free": h_free,
-        "z_top": monopile_z_top(hs, air_gap, safety_margin),
+        "z_top": monopile_z_top(hs),
     }
