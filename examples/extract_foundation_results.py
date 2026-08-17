@@ -1,8 +1,9 @@
 """
 Append foundation structural metrics from a WISDEM run to type-specific CSVs.
 
-Monopile runs append to results_monopile.csv; jacket runs append to
-results_jacket.csv. Foundation type is detected from modeling flags.
+Monopile runs append to results_monopile.csv. Jacket runs append to
+results_jacket.csv (four legs) or results_jacket_3.csv (three legs).
+Foundation type and jacket leg count are detected from modeling flags/options.
 One row per run; unavailable columns are written blank (NaN).
 """
 
@@ -60,6 +61,16 @@ JACKET_CSV_COLUMNS = [
 _EXAMPLES_DIR = os.path.dirname(os.path.realpath(__file__))
 MONOPILE_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_monopile.csv")
 JACKET_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_jacket.csv")
+JACKET_3_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_jacket_3.csv")
+
+
+def _jacket_n_legs(modeling_options):
+    """Read jacket leg count from FixedBottomSE modeling options (default 4)."""
+    try:
+        n = int(modeling_options["WISDEM"]["FixedBottomSE"]["n_legs"])
+    except (KeyError, TypeError, ValueError):
+        return 4
+    return 3 if n == 3 else 4
 
 
 def _scalar(value, default=np.nan, reduce="first"):
@@ -110,9 +121,11 @@ def columns_for_foundation_type(ftype):
     raise ValueError(f"Unknown foundation type '{ftype}'; expected jacket or monopile")
 
 
-def csv_path_for_foundation_type(ftype):
+def csv_path_for_foundation_type(ftype, modeling_options=None):
     """Return the append-only CSV path for a detected foundation type."""
     if ftype == "jacket":
+        if modeling_options is not None and _jacket_n_legs(modeling_options) == 3:
+            return JACKET_3_CSV_PATH
         return JACKET_CSV_PATH
     if ftype == "monopile":
         return MONOPILE_CSV_PATH
@@ -184,8 +197,9 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=No
     """
     Append one foundation-results row.
 
-    If csv_path is None, routes automatically to results_jacket.csv or
-    results_monopile.csv based on modeling flags.
+    If csv_path is None, routes automatically to results_jacket.csv,
+    results_jacket_3.csv (three-legged jackets), or results_monopile.csv
+    based on modeling flags and n_legs.
 
     extras : optional dict of extra column values (e.g. loads, site params).
 
@@ -197,7 +211,7 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=No
     ftype = _detect_foundation_type(modeling_options)
     columns = columns_for_foundation_type(ftype)
     if csv_path is None:
-        csv_path = csv_path_for_foundation_type(ftype)
+        csv_path = csv_path_for_foundation_type(ftype, modeling_options)
 
     row = collect_foundation_row(wt_opt, modeling_options, extras=extras)
 
@@ -247,3 +261,4 @@ if __name__ == "__main__":
     print("Import append_foundation_results(wt_opt, modeling_options) after run_wisdem.")
     print(f"Monopile CSV:  {MONOPILE_CSV_PATH}")
     print(f"Jacket CSV:    {JACKET_CSV_PATH}")
+    print(f"Jacket 3-leg:  {JACKET_3_CSV_PATH}")

@@ -14,7 +14,7 @@ Engineering rules (conceptual design):
   t_min = D / 120   (monopile wall thickness [m], D in m)
   n_bays from jacket freeboard height thresholds
   equal bay spacing from n_bays
-  jackets use four legs
+  jackets use three or four legs (from geometry, default four)
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ DEFAULT_SOIL_SHEAR_MODULUS_PA = 140.0e6
 DEFAULT_SOIL_POISSON = 0.4
 MONOPILE_WALL_T_D_TO_T_RATIO = 120.0  # t >= D / ratio
 N_LEGS_JACKET = 4
+ALLOWED_N_LEGS_JACKET = (3, 4)
 
 # Jacket freeboard height [m] → number of bays
 BAY_HEIGHT_THRESHOLDS_M = (50.0, 80.0)  # <50 → 3; 50–80 → 4; >80 → 5
@@ -210,20 +211,44 @@ def mudline_diameter_from_geometry(monopile: dict[str, Any]) -> float:
     return float(np.atleast_1d(np.asarray(values, dtype=float)).flatten()[0])
 
 
+def validate_jacket_n_legs(n_legs: int) -> int:
+    """Return n_legs if it is an allowed jacket leg count (3 or 4)."""
+    n = int(n_legs)
+    if n not in ALLOWED_N_LEGS_JACKET:
+        allowed = ", ".join(str(x) for x in ALLOWED_N_LEGS_JACKET)
+        raise ValueError(f"jacket n_legs must be one of [{allowed}], got {n}")
+    return n
+
+
+def resolve_jacket_n_legs(jacket: dict[str, Any], n_legs: int | None = None) -> int:
+    """
+    Resolve jacket leg count from an explicit override or the geometry dict.
+
+    When n_legs is omitted, use jacket['n_legs'] if present and valid, else N_LEGS_JACKET.
+    """
+    if n_legs is not None:
+        return validate_jacket_n_legs(n_legs)
+    if "n_legs" in jacket and jacket["n_legs"] is not None:
+        return validate_jacket_n_legs(jacket["n_legs"])
+    return validate_jacket_n_legs(N_LEGS_JACKET)
+
+
 def apply_jacket_topology(
     jacket: dict[str, Any],
     freeboard_height: float,
-    n_legs: int = N_LEGS_JACKET,
+    n_legs: int | None = None,
 ) -> dict[str, Any]:
     """
     Set jacket height, n_legs, n_bays, equal bay_spacing; resize brace arrays.
 
+    n_legs may be passed explicitly or read from jacket; default is four legs.
     New bay diameter/thickness entries are seeded from the last baseline value.
     """
     jacket = dict(jacket)
+    n_legs = resolve_jacket_n_legs(jacket, n_legs=n_legs)
     n_bays = n_bays_from_height(freeboard_height)
     jacket["height"] = float(freeboard_height)
-    jacket["n_legs"] = int(n_legs)
+    jacket["n_legs"] = n_legs
     jacket["n_bays"] = int(n_bays)
     jacket["bay_spacing"] = equal_bay_spacing(n_bays)
 
@@ -381,7 +406,8 @@ def apply_wt_geometry_rules(
     comps = wt.setdefault("components", {})
 
     if foundation_type == "jacket":
-        comps["jacket"] = apply_jacket_topology(comps["jacket"], site["H_free"])
+        n_legs = resolve_jacket_n_legs(comps["jacket"])
+        comps["jacket"] = apply_jacket_topology(comps["jacket"], site["H_free"], n_legs=n_legs)
         # Align tower base with jacket top (mudline at 0 for jackets in examples is different;
         # jacket height is freeboard; tower typically starts at jacket top above MWL).
         # Jacket top elevation above MWL = H_free - water_depth = 1.98*Hs + 0.2*Hs.

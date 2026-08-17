@@ -74,19 +74,35 @@ class TestConceptualDesignRules(unittest.TestCase):
             "brace_thicknesses": [0.1, 0.1, 0.1, 0.1],
             "bay_spacing": [0.1, 0.3, 0.5, 0.7, 0.9],
         }
-        # H_free=45 → 3 bays
+        # H_free=45 → 3 bays; preserve three legs from geometry
         out = cdr.apply_jacket_topology(jacket, 45.0)
-        self.assertEqual(out["n_legs"], 4)
+        self.assertEqual(out["n_legs"], 3)
         self.assertEqual(out["n_bays"], 3)
         self.assertEqual(out["height"], 45.0)
         self.assertEqual(len(out["bay_spacing"]), 4)
         self.assertEqual(len(out["brace_diameters"]), 3)
         self.assertEqual(len(out["brace_thicknesses"]), 3)
 
+        # Default when geometry omits n_legs is four legs
+        jacket.pop("n_legs")
+        out_default = cdr.apply_jacket_topology(jacket, 45.0)
+        self.assertEqual(out_default["n_legs"], 4)
+
+        # Explicit override
+        out_four = cdr.apply_jacket_topology(jacket, 45.0, n_legs=4)
+        self.assertEqual(out_four["n_legs"], 4)
+
         # H_free=90 → 5 bays; seed from last brace size
-        out2 = cdr.apply_jacket_topology(jacket, 90.0)
+        out2 = cdr.apply_jacket_topology(jacket, 90.0, n_legs=3)
         self.assertEqual(out2["n_bays"], 5)
+        self.assertEqual(out2["n_legs"], 3)
         self.assertEqual(out2["brace_diameters"], [1.0] * 5)
+
+    def test_validate_jacket_n_legs(self):
+        self.assertEqual(cdr.validate_jacket_n_legs(3), 3)
+        self.assertEqual(cdr.validate_jacket_n_legs(4), 4)
+        with self.assertRaises(ValueError):
+            cdr.validate_jacket_n_legs(5)
 
     def test_apply_monopile_geometry_provisional(self):
         mono = {

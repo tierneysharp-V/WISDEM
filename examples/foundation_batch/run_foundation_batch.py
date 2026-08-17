@@ -10,6 +10,9 @@ Usage:
 Site CSV columns (required):
   turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m
 
+Optional site CSV column:
+  n_legs — jacket leg count for this row (3 or 4). When omitted, --jacket-legs applies.
+
 Turbine lookup CSV:
   First column = parameter (YAML path or special key). Remaining columns = turbines.
   Special row `_source_yaml` may point at a full geometry YAML; other rows override.
@@ -1276,6 +1279,32 @@ def resolve_foundations(mode: str) -> list[str]:
     raise ValueError(f"Invalid --foundation '{mode}'. Use jacket, monopile, or both.")
 
 
+def resolve_jacket_leg_counts(scenario: dict, jacket_legs_mode: str, cdr) -> list[int]:
+    """
+    Leg counts to run for one scenario row.
+
+    Per-row ``n_legs`` in the site CSV overrides ``--jacket-legs`` when set to 3 or 4.
+    """
+    if not _is_blank(scenario.get("n_legs", "")):
+        return [cdr.validate_jacket_n_legs(int(_to_float(scenario["n_legs"])))]
+    mode = jacket_legs_mode.lower().strip()
+    if mode == "both":
+        return [3, 4]
+    return [cdr.validate_jacket_n_legs(int(mode))]
+
+
+def set_jacket_n_legs(wt: dict, n_legs: int) -> dict:
+    """Set jacket leg count on a geometry dict (deep copy)."""
+    wt = copy.deepcopy(wt)
+    wt.setdefault("components", {}).setdefault("jacket", {})["n_legs"] = int(n_legs)
+    return wt
+
+
+def _jacket_warmstart_key(scenario: dict, n_legs: int) -> tuple:
+    """Warm-start cache key for jacket (site/turbine fields + leg count)."""
+    return _scenario_key_for_warmstart(scenario) + (int(n_legs),)
+
+
 _D_LO = 3.87
 _D_HI = 16.0
 _T_LO = 5e-2
@@ -1742,7 +1771,7 @@ def compute_loads_stage(
 
 
 def scenario_result_extras(scenario: dict, loads: dict, f_lo: float = None, f_hi: float = None, exit_mode=None) -> dict:
-    """Site + tower-base load fields written into results_monopile.csv / results_jacket.csv."""
+    """Site + tower-base load fields written into results_monopile.csv, results_jacket.csv, or results_jacket_3.csv."""
     extras = {
         "tower_base_shear_N": loads["shear_N"],
         "tower_base_vertical_N": loads["vertical_N"],
@@ -1765,6 +1794,7 @@ def run_batch(
     csv_path: str,
     turbine_csv: str,
     foundation_mode: str = "both",
+    jacket_legs_mode: str = "both",
     stop_on_error: bool = False,
 ) -> int:
     run_wisdem, append_foundation_results, cdr = _setup_wisdem()
@@ -1784,6 +1814,11 @@ def run_batch(
     print(f"Loaded {len(scenarios)} scenario row(s) from {csv_path}")
     print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
+    if "jacket" in foundations:
+        print(
+            f"Jacket leg counts: --jacket-legs={jacket_legs_mode} "
+            "(optional CSV column n_legs overrides per row)"
+        )
 
     for scenario in scenarios:
         row_num = scenario["_csv_row_number"]
@@ -1791,159 +1826,188 @@ def run_batch(
         turb_name, turb_params = lookup_turbine_column(turbines, rating, turbine_csv)
         print(f"\n### CSV row {row_num}: rating={rating:g} W -> turbine '{turb_name}' ###")
 
+        jacket_loads = None
+
         for ftype in foundations:
             paths = BASELINES[ftype]
-            tag = f"{ftype}_row{row_num}"
+            leg_counts = (
+                resolve_jacket_leg_counts(scenario, jacket_legs_mode, cdr)
+                if ftype == "jacket"
+                else [None]
+            )
 
-            try:
-                full_wt = build_turbine_geometry(
-                    turb_params, turbine_csv, ftype, baselines_wt[ftype]
-                )
-                f_lo, f_hi = compute_frequency_bounds(full_wt)
+            for n_legs in leg_counts:
+                tag = f"{ftype}_row{row_num}" + (f"_legs{n_legs}" if n_legs is not None else "")
 
-                # Stage 1: compute loads
-                loads = compute_loads_stage(
-                    run_wisdem, full_wt, scenario, ftype, tag, cdr
-                )
-
-                # Stage 2: Loading-driven foundation sizing (rated + parked extreme)
-                modeling, extreme = inject_loading(
-                    baselines_modeling[ftype], scenario, loads, full_wt
-                )
-                modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}.yaml")
-                dump_yaml(modeling, modeling_out)
-
-                analysis = load_yaml(paths["analysis"])
-                analysis = patch_frequency_bounds(analysis, f_lo, f_hi, foundation_type=ftype)
-                analysis.setdefault("general", {})
-
-                analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}")
-                analysis["general"]["fname_output"] = "refturb_output"
-                analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}.yaml")
-                dump_yaml(analysis, analysis_out)
-
-                site = cdr.resolve_site_params(modeling)
-                print(f"\n=== Sizing {ftype} scenario CSV row {row_num} ===")
-                print(
-                    f"  Site: WD={site['water_depth']:.3f} m, Hs={site['hs']:.3f} m, "
-                    f"H_free={site['H_free']:.3f} m"
-                )
-                g_soil = modeling.get("Environment", {}).get("soil_shear_modulus", None)
-                if g_soil is not None:
-                    print(f"  soil_shear_modulus = {g_soil:.6g} Pa")
-                print(f"  n_dlc = {modeling['WISDEM'].get('n_dlc')}")
-                print(
-                    f"  DLC1 rated RNA Fx/Fz/My = "
-                    f"{loads['force'][0]:.6g} / {loads['force'][2]:.6g} / {loads['moment'][1]:.6g}, "
-                    f"Uref={loads['velocity']:.4g} m/s"
-                )
-                print(
-                    f"  DLC2 extreme (Cd={extreme['Cd']}, D_rotor={extreme['rotor_diameter_m']:.3g} m) "
-                    f"Fx/Fz/My = "
-                    f"{extreme['force'][0]:.6g} / {extreme['force'][2]:.6g} / {extreme['moment'][1]:.6g}, "
-                    f"Uref={extreme['velocity']:.4g} m/s"
-                )
-                if ftype == "jacket":
-                    print(f"  Jacket topology: n_legs=4, n_bays={cdr.n_bays_from_height(site['H_free'])}")
-
-                slim_wt = slim_sizing_geometry(full_wt, ftype)
-                wt_geom = patch_geometry(slim_wt, modeling, ftype, cdr)
-
-                ws_key = _scenario_key_for_warmstart(scenario)
-                if ftype == "monopile" and ws_key in mono_warmstart:
-                    d_ws, t_ws = mono_warmstart[ws_key]
-                    d_ws = max(d_ws, monopile_diameter_floor(wt_geom))
-                    print(f"  Warm-start from previous soil case: D={d_ws:.4f} m, t={t_ws*1e3:.2f} mm")
-                    wt_geom = seed_monopile_diameter_thickness(wt_geom, d_ws, t_ws)
-                    wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
-                elif ftype == "monopile":
-                    wt_geom = scale_monopile_cold_start(wt_geom)
-                    wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
-                elif ftype == "jacket" and ws_key in jacket_warmstart:
-                    r_h, ratio, leg_d, leg_t, brace_d, brace_t = jacket_warmstart[ws_key]
-                    print(
-                        f"  Warm-start from previous soil case: "
-                        f"r_head={r_h:.3f} m, ratio={ratio:.3f}, leg_D={leg_d:.3f} m"
+                try:
+                    full_wt = build_turbine_geometry(
+                        turb_params, turbine_csv, ftype, baselines_wt[ftype]
                     )
-                    wt_geom = seed_jacket_geometry(
-                        wt_geom, r_h, ratio, leg_d, leg_t, list(brace_d), list(brace_t)
-                    )
-                elif ftype == "jacket":
-                    wt_geom = scale_jacket_cold_start(wt_geom)
+                    if n_legs is not None:
+                        full_wt = set_jacket_n_legs(full_wt, n_legs)
+                    f_lo, f_hi = compute_frequency_bounds(full_wt)
 
-                if ftype == "monopile":
-                    analysis = patch_monopile_diameter_bounds(analysis, wt_geom)
-                    analysis = patch_monopile_thickness_bounds(analysis, wt_geom)
-
-                wt_out = os.path.join(TMP_DIR, f"geometry_{tag}.yaml")
-                dump_yaml(wt_geom, wt_out)
-                dump_yaml(analysis, analysis_out)
-                print(f"  geometry: {wt_out}")
-                print(f"  modeling: {modeling_out}")
-
-                if ftype == "monopile":
-                    wt_opt, modeling_options, exit_mode, d_opt, t_opt = run_monopile_two_stage(
-                        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr, f_lo, f_hi
-                    )
-                    if design_is_warmstart_safe(wt_opt, f_lo, f_hi):
-                        mono_warmstart[ws_key] = (d_opt, t_opt)
+                    # Stage 1: compute loads (reuse across 3/4-leg jacket runs on same row)
+                    if ftype == "jacket":
+                        if jacket_loads is None:
+                            jacket_loads = compute_loads_stage(
+                                run_wisdem, full_wt, scenario, ftype, tag, cdr
+                            )
+                        loads = jacket_loads
                     else:
-                        util = max_strength_utilization(wt_opt)
-                        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
-                        print(
-                            f"  Skipping warm-start cache (util={util:.3f}, f1={f1:.4f} Hz); "
-                            "next soil row will cold-start"
+                        loads = compute_loads_stage(
+                            run_wisdem, full_wt, scenario, ftype, tag, cdr
                         )
-                        mono_warmstart.pop(ws_key, None)
-                    extras = scenario_result_extras(scenario, loads, f_lo, f_hi, exit_mode=exit_mode)
-                    out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
-                else:
-                    wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
-                        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
-                    )
-                    freq_on = bool(
-                        analysis.get("constraints", {})
-                        .get("jacket", {})
-                        .get("frequency_1", {})
-                        .get("flag", False)
-                    )
-                    if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
-                        r_h, ratio, leg_d, leg_t, brace_d, brace_t = j_dvs
-                        jacket_warmstart[ws_key] = (
-                            r_h,
-                            ratio,
-                            leg_d,
-                            leg_t,
-                            tuple(brace_d),
-                            tuple(brace_t),
-                        )
-                    else:
-                        util = max_strength_utilization(wt_opt)
-                        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
-                        print(
-                            f"  Skipping jacket warm-start cache (util={util:.3f}, f1={f1:.4f} Hz); "
-                            "next soil row will cold-start"
-                        )
-                        jacket_warmstart.pop(ws_key, None)
-                    extras = scenario_result_extras(
-                        scenario, loads, f_lo, f_hi, exit_mode=exit_mode
-                    )
-                    out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
 
-                print(f"  OK -> {out_csv}")
-                if exit_mode is not None and exit_mode != 0:
-                    print(
-                        f"  NOTE: optimizer exit_mode={exit_mode} "
-                        "(0=success; 8=linesearch stuck; 9=iteration limit). "
-                        "Row was still appended — check opt_exit_mode / f1_Hz in CSV."
+                    # Stage 2: Loading-driven foundation sizing (rated + parked extreme)
+                    modeling, extreme = inject_loading(
+                        baselines_modeling[ftype], scenario, loads, full_wt
                     )
-                n_ok += 1
-            except Exception as exc:
-                n_fail += 1
-                print(f"  FAILED {ftype} row {row_num}: {exc}")
-                traceback.print_exc()
-                if stop_on_error:
-                    raise
+                    modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}.yaml")
+                    dump_yaml(modeling, modeling_out)
+
+                    analysis = load_yaml(paths["analysis"])
+                    analysis = patch_frequency_bounds(analysis, f_lo, f_hi, foundation_type=ftype)
+                    analysis.setdefault("general", {})
+
+                    analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}")
+                    analysis["general"]["fname_output"] = "refturb_output"
+                    analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}.yaml")
+                    dump_yaml(analysis, analysis_out)
+
+                    site = cdr.resolve_site_params(modeling)
+                    leg_label = f", n_legs={n_legs}" if n_legs is not None else ""
+                    print(f"\n=== Sizing {ftype} scenario CSV row {row_num}{leg_label} ===")
+                    print(
+                        f"  Site: WD={site['water_depth']:.3f} m, Hs={site['hs']:.3f} m, "
+                        f"H_free={site['H_free']:.3f} m"
+                    )
+                    g_soil = modeling.get("Environment", {}).get("soil_shear_modulus", None)
+                    if g_soil is not None:
+                        print(f"  soil_shear_modulus = {g_soil:.6g} Pa")
+                    print(f"  n_dlc = {modeling['WISDEM'].get('n_dlc')}")
+                    print(
+                        f"  DLC1 rated RNA Fx/Fz/My = "
+                        f"{loads['force'][0]:.6g} / {loads['force'][2]:.6g} / {loads['moment'][1]:.6g}, "
+                        f"Uref={loads['velocity']:.4g} m/s"
+                    )
+                    print(
+                        f"  DLC2 extreme (Cd={extreme['Cd']}, D_rotor={extreme['rotor_diameter_m']:.3g} m) "
+                        f"Fx/Fz/My = "
+                        f"{extreme['force'][0]:.6g} / {extreme['force'][2]:.6g} / {extreme['moment'][1]:.6g}, "
+                        f"Uref={extreme['velocity']:.4g} m/s"
+                    )
+                    if ftype == "jacket":
+                        print(
+                            f"  Jacket topology: n_legs={n_legs}, "
+                            f"n_bays={cdr.n_bays_from_height(site['H_free'])}"
+                        )
+
+                    slim_wt = slim_sizing_geometry(full_wt, ftype)
+                    wt_geom = patch_geometry(slim_wt, modeling, ftype, cdr)
+
+                    if ftype == "jacket":
+                        ws_key = _jacket_warmstart_key(scenario, n_legs)
+                    else:
+                        ws_key = _scenario_key_for_warmstart(scenario)
+
+                    if ftype == "monopile" and ws_key in mono_warmstart:
+                        d_ws, t_ws = mono_warmstart[ws_key]
+                        d_ws = max(d_ws, monopile_diameter_floor(wt_geom))
+                        print(f"  Warm-start from previous soil case: D={d_ws:.4f} m, t={t_ws*1e3:.2f} mm")
+                        wt_geom = seed_monopile_diameter_thickness(wt_geom, d_ws, t_ws)
+                        wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
+                    elif ftype == "monopile":
+                        wt_geom = scale_monopile_cold_start(wt_geom)
+                        wt_geom = cdr.apply_wt_geometry_rules(wt_geom, modeling, "monopile")
+                    elif ftype == "jacket" and ws_key in jacket_warmstart:
+                        r_h, ratio, leg_d, leg_t, brace_d, brace_t = jacket_warmstart[ws_key]
+                        print(
+                            f"  Warm-start from previous soil case: "
+                            f"r_head={r_h:.3f} m, ratio={ratio:.3f}, leg_D={leg_d:.3f} m"
+                        )
+                        wt_geom = seed_jacket_geometry(
+                            wt_geom, r_h, ratio, leg_d, leg_t, list(brace_d), list(brace_t)
+                        )
+                    elif ftype == "jacket":
+                        wt_geom = scale_jacket_cold_start(wt_geom)
+
+                    if ftype == "monopile":
+                        analysis = patch_monopile_diameter_bounds(analysis, wt_geom)
+                        analysis = patch_monopile_thickness_bounds(analysis, wt_geom)
+
+                    wt_out = os.path.join(TMP_DIR, f"geometry_{tag}.yaml")
+                    dump_yaml(wt_geom, wt_out)
+                    dump_yaml(analysis, analysis_out)
+                    print(f"  geometry: {wt_out}")
+                    print(f"  modeling: {modeling_out}")
+
+                    if ftype == "monopile":
+                        wt_opt, modeling_options, exit_mode, d_opt, t_opt = run_monopile_two_stage(
+                            run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, cdr, f_lo, f_hi
+                        )
+                        if design_is_warmstart_safe(wt_opt, f_lo, f_hi):
+                            mono_warmstart[ws_key] = (d_opt, t_opt)
+                        else:
+                            util = max_strength_utilization(wt_opt)
+                            f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+                            print(
+                                f"  Skipping warm-start cache (util={util:.3f}, f1={f1:.4f} Hz); "
+                                "next soil row will cold-start"
+                            )
+                            mono_warmstart.pop(ws_key, None)
+                        extras = scenario_result_extras(scenario, loads, f_lo, f_hi, exit_mode=exit_mode)
+                        out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
+                    else:
+                        wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
+                            run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
+                        )
+                        freq_on = bool(
+                            analysis.get("constraints", {})
+                            .get("jacket", {})
+                            .get("frequency_1", {})
+                            .get("flag", False)
+                        )
+                        if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
+                            r_h, ratio, leg_d, leg_t, brace_d, brace_t = j_dvs
+                            jacket_warmstart[ws_key] = (
+                                r_h,
+                                ratio,
+                                leg_d,
+                                leg_t,
+                                tuple(brace_d),
+                                tuple(brace_t),
+                            )
+                        else:
+                            util = max_strength_utilization(wt_opt)
+                            f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+                            print(
+                                f"  Skipping jacket warm-start cache (util={util:.3f}, f1={f1:.4f} Hz); "
+                                "next soil row will cold-start"
+                            )
+                            jacket_warmstart.pop(ws_key, None)
+                        extras = scenario_result_extras(
+                            scenario, loads, f_lo, f_hi, exit_mode=exit_mode
+                        )
+                        out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
+
+                    print(f"  OK -> {out_csv}")
+                    if exit_mode is not None and exit_mode != 0:
+                        print(
+                            f"  NOTE: optimizer exit_mode={exit_mode} "
+                            "(0=success; 8=linesearch stuck; 9=iteration limit). "
+                            "Row was still appended — check opt_exit_mode / f1_Hz in CSV."
+                        )
+                    n_ok += 1
+                except Exception as exc:
+                    n_fail += 1
+                    fail_label = f"{ftype} row {row_num}"
+                    if n_legs is not None:
+                        fail_label += f" (n_legs={n_legs})"
+                    print(f"  FAILED {fail_label}: {exc}")
+                    traceback.print_exc()
+                    if stop_on_error:
+                        raise
 
     print(f"\nBatch finished: {n_ok} succeeded, {n_fail} failed")
     return 0 if n_fail == 0 else 1
@@ -1969,6 +2033,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Which foundation baseline(s) to run (default: both).",
     )
     parser.add_argument(
+        "--jacket-legs",
+        choices=("3", "4", "both"),
+        default="both",
+        help=(
+            "Jacket leg counts to run per scenario (default: both). "
+            "Three-legged results append to examples/results_jacket_3.csv; "
+            "four-legged results append to examples/results_jacket.csv. "
+            "Optional site CSV column n_legs (3 or 4) overrides this for that row."
+        ),
+    )
+    parser.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop at the first failed scenario instead of continuing.",
@@ -1978,6 +2053,7 @@ def main(argv: list[str] | None = None) -> int:
         args.input_csv,
         turbine_csv=args.turbine_csv,
         foundation_mode=args.foundation,
+        jacket_legs_mode=args.jacket_legs,
         stop_on_error=args.stop_on_error,
     )
 
