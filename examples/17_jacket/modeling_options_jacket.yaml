@@ -33,6 +33,8 @@ WISDEM:
         buckling_method: dnvgl # Buckling code type [eurocode or dnvgl]
         buckling_length: 15    # Buckling parameter
         save_truss_figures: False
+        member_wind: True
+        member_hydro: True
         frame3dd:
             shear: True
             geom: True

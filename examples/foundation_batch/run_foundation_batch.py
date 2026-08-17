@@ -1289,7 +1289,7 @@ _J_LEG_T_LO, _J_LEG_T_HI = 0.05, 0.1
 _J_BRACE_D_LO, _J_BRACE_D_HI = 0.5, 2.0
 _J_BRACE_T_LO, _J_BRACE_T_HI = 0.05, 0.1  # keep t < 0.5 * brace_D_lo
 _J_T_OVER_D_MAX = 0.45  # Tube Area → 0 when t >= D
-_J_FLARE_LO, _J_FLARE_HI = 0.1, 0.15  # (r_foot - r_head) / height
+_J_FLARE_LO, _J_FLARE_HI = 0.1, 1.0  # (r_foot - r_head) / height
 
 
 def repair_feasible_monopile_start(

@@ -1049,6 +1049,11 @@ def assign_tower_values(wt_opt, modeling_options, tower):
             wt_opt["fixedse.monopile.rna_F"] = F
             wt_opt["fixedse.monopile.rna_M"] = M
 
+        if modeling_options["flags"]["jacket"] and modeling_options["WISDEM"]["FixedBottomSE"].get("member_wind", False):
+            for k in range(n_dlc):
+                kstr = "" if n_dlc <= 1 else str(k + 1)
+                wt_opt[f"fixedse.Uref{kstr}"] = modeling_options["WISDEM"]["Loading"]["loads"][k]["velocity"]
+
     return wt_opt
 
 

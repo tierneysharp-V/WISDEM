@@ -47,6 +47,8 @@ JACKET_CSV_COLUMNS = [
     "soil_shear_modulus_Pa",
     "jacket_height_m",
     "jacket_footprint_m",
+    "leg_diameter_m",
+    "leg_thickness_m",
     "jacket_mass_kg",
     "scour_protection_volume_m3",
     "transition_piece_mass_kg",
@@ -132,6 +134,8 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
         row["jacket_mass_kg"] = jacket_mass
         row["jacket_height_m"] = _get_val(wt_opt, "jacket.height", units="m")
         row["jacket_footprint_m"] = _get_val(wt_opt, "fixedse.r_foot", units="m")
+        row["leg_diameter_m"] = _get_val(wt_opt, "jacket.leg_diameter", units="m")
+        row["leg_thickness_m"] = _get_val(wt_opt, "jacket.leg_thickness", units="m")
         row["transition_piece_mass_kg"] = tp_mass
         if np.isfinite(jacket_mass) and np.isfinite(tp_mass):
             row["total_foundation_mass_kg"] = jacket_mass + tp_mass

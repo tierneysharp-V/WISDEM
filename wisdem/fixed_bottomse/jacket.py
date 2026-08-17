@@ -6,8 +6,11 @@ by Jan Häfele, Rick R. Damiani, Ryan N. King, Cristian G. Gebhardt, and Raimund
 Accessible via: https://wes.copernicus.org/articles/3/553/2018/
 """
 
+import math
+
 import numpy as np
 import openmdao.api as om
+from scipy.optimize import brentq
 
 import wisdem.pyframe3dd.pyframe3dd as pyframe3dd
 import wisdem.commonse.manufacturing as manu
@@ -18,7 +21,470 @@ from wisdem.fixed_bottomse.conceptual_design_rules import (
     HSIG_CLEARANCE_SECONDARY,
 )
 import wisdem.commonse.utilization_constraints as util_con
+import wisdem.commonse.utilities as util
 from wisdem.commonse import NFREQ, RIGID, gravity
+from wisdem.commonse.utilities import cosd, sind
+from wisdem.commonse.wind_wave_drag import cylinderDrag
+
+
+def jacket_n_elem(n_legs, n_bays, mud_brace):
+    """Number of Frame3DD elements in the jacket truss (including ghost members)."""
+    return 2 * (n_legs * (n_bays + 1)) + 4 * (n_legs * n_bays) + int(mud_brace) * n_legs + n_legs
+
+
+def build_jacket_element_geometry(
+    leg_nodes,
+    bay_nodes,
+    leg_diameter,
+    leg_thickness,
+    brace_diameters,
+    brace_thicknesses,
+    n_legs,
+    n_bays,
+    mud_brace,
+):
+    """
+    Build element endpoint coordinates and diameters in the same order as ComputeFrame3DD.
+
+    Returns
+    -------
+    joint1 : ndarray[n_elem, 3]
+    joint2 : ndarray[n_elem, 3]
+    diameters : ndarray[n_elem]
+    """
+    x_nodes = np.zeros((n_legs, n_bays, 3))
+    for jdx in range(n_bays):
+        for idx in range(n_legs):
+            n1 = bay_nodes[idx, jdx]
+            n2 = bay_nodes[(idx + 1) % n_legs, (jdx + 1) % (n_bays + 1)]
+            n3 = bay_nodes[(idx + 1) % n_legs, jdx]
+            n4 = bay_nodes[idx, (jdx + 1) % (n_bays + 1)]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                alpha = (n4 - n2) / ((n1 - n2) - (n3 - n4))
+            alpha = alpha[0]
+            x_nodes[idx, jdx, :] = n4 + alpha * (n3 - n4)
+
+    ghost_nodes = np.mean(leg_nodes[:, -1, :], axis=0)
+    ghost_nodes[2] += 2.0
+    ghost_nodes = ghost_nodes.reshape(1, 1, 3)
+
+    joint1 = []
+    joint2 = []
+    diameters = []
+
+    def add_elem(n1, n2, diameter):
+        joint1.append(np.array(n1, dtype=np.float64))
+        joint2.append(np.array(n2, dtype=np.float64))
+        diameters.append(float(diameter))
+
+    leg_d = float(np.asarray(leg_diameter).flatten()[0])
+    leg_t = float(np.asarray(leg_thickness).flatten()[0])
+
+    for jdx in range(n_bays + 1):
+        for idx in range(n_legs):
+            add_elem(leg_nodes[idx, jdx], bay_nodes[idx, jdx], leg_d)
+            add_elem(bay_nodes[idx, jdx], leg_nodes[idx, jdx + 1], leg_d)
+
+    for jdx in range(n_bays):
+        brace_d = float(brace_diameters[jdx])
+        for idx in range(n_legs):
+            add_elem(bay_nodes[idx, jdx], x_nodes[idx, jdx], brace_d)
+            add_elem(x_nodes[idx, jdx], bay_nodes[(idx + 1) % n_legs, (jdx + 1) % (n_bays + 1)], brace_d)
+            add_elem(bay_nodes[(idx + 1) % n_legs, jdx], x_nodes[idx, jdx], brace_d)
+            add_elem(x_nodes[idx, jdx], bay_nodes[idx, (jdx + 1) % (n_bays + 1)], brace_d)
+
+    if mud_brace:
+        brace_d = float(brace_diameters[0])
+        for idx in range(n_legs):
+            add_elem(bay_nodes[idx, 0], bay_nodes[(idx + 1) % n_legs, 0], brace_d)
+
+    for idx in range(n_legs):
+        add_elem(leg_nodes[idx, -1], ghost_nodes[0, 0], 1.0e-2)
+
+    return np.vstack(joint1), np.vstack(joint2), np.array(diameters)
+
+
+def _power_wind_speed(Uref, zref, z, z0, shear_exp):
+    z = np.atleast_1d(z)
+    zref = float(zref)
+    z0 = float(z0)
+    if zref <= z0:
+        return np.zeros_like(z, dtype=np.float64) + float(Uref)
+    ratio = np.maximum((z - z0) / (zref - z0), 0.0)
+    return float(Uref) * ratio ** float(shear_exp)
+
+
+def _global_wind_line_loads(U, d, rho_air, mu_air, beta_wind, cd_usr):
+    q = 0.5 * rho_air * U**2
+    if cd_usr < 0.0:
+        Re = rho_air * U * d / mu_air
+        cd, _ = cylinderDrag(Re)
+    else:
+        cd = cd_usr
+    Fp = q * cd * d
+    return Fp * cosd(beta_wind), Fp * sind(beta_wind), np.zeros_like(Fp), q
+
+
+def _linear_wave_kinematics(z, water_depth, hsig, tsig, uc, rho_water):
+    """Wave kinematics at jacket elevation z (z=0 at mudline, waterline at z=water_depth)."""
+    z = np.atleast_1d(z).astype(np.float64)
+    z_floor = 0.0
+    z_surf = float(water_depth)
+    depth = z_surf - z_floor
+    if depth <= 0.0 or hsig == 0.0 or tsig == 0.0:
+        zeros = np.zeros_like(z)
+        return zeros, zeros, zeros
+
+    omega = 2.0 * np.pi / float(tsig)
+    k = brentq(lambda kk: omega**2 - gravity * kk * np.tanh(depth * kk), 0, 1e3 * omega**2 / gravity, disp=False)
+    amplitude = 0.5 * float(hsig)
+    z_rel = z - z_surf
+
+    u_wave = amplitude * omega * np.cosh(k * (z_rel + depth)) / np.sinh(k * depth) + float(uc)
+    accel = (u_wave - float(uc)) * omega
+    pressure = float(rho_water) * gravity * (
+        amplitude * np.cosh(k * (z_rel + depth)) / np.cosh(k * depth) - z_rel
+    )
+
+    submerged = np.logical_and(z >= z_floor, z <= z_surf)
+    u_wave = np.where(submerged, u_wave, 0.0)
+    accel = np.where(submerged, accel, 0.0)
+    pressure = np.where(submerged, pressure, 0.0)
+    return u_wave, accel, pressure
+
+
+def _global_wave_line_loads(U, A, p, d, rho_water, mu_water, beta_wave, ca_usr, cd_usr):
+    q = 0.5 * rho_water * U * np.abs(U)
+    if cd_usr < 0.0:
+        Re = rho_water * np.abs(U) * d / mu_water
+        cd, _ = cylinderDrag(Re)
+    else:
+        cd = cd_usr
+    if ca_usr < 0.0:
+        ca = 1.0
+    else:
+        ca = ca_usr
+    fi = rho_water * ca * math.pi / 4.0 * d**2 * A
+    fd = q * cd * d
+    fp = fi + fd
+    return fp * cosd(beta_wave), fp * sind(beta_wave), np.zeros_like(fp), q + p
+
+
+def _global_to_member_loads(joint1, joint2, px_g, py_g, pz_g):
+    dxyz = joint2 - joint1
+    unit_x = np.array([1.0, 0.0, 0.0])
+    R = util.rotate_align_vectors(dxyz, unit_x)
+    p_local = R @ np.array([px_g, py_g, pz_g])
+    return p_local[0], p_local[1], p_local[2]
+
+
+class JacketWindLoads(om.ExplicitComponent):
+    """
+    Distributed wind loads on jacket members using the monopile MemberLoads physics
+    (power-law wind profile, cylinder drag, global-to-member rotation).
+    """
+
+    def initialize(self):
+        self.options.declare("modeling_options")
+
+    def setup(self):
+        mod_opt = self.options["modeling_options"]
+        n_dlc = mod_opt["WISDEM"]["n_dlc"]
+        n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
+        n_elem = jacket_n_elem(n_legs, n_bays, mud_brace)
+
+        self.add_input("leg_nodes", val=np.zeros((n_legs, n_bays + 2, 3)), units="m")
+        self.add_input("bay_nodes", val=np.zeros((n_legs, n_bays + 1, 3)), units="m")
+        self.add_input("leg_diameter", val=1.4, units="m")
+        self.add_input("leg_thickness", val=0.1, units="m")
+        self.add_input("brace_diameters", val=np.ones((n_bays)), units="m")
+        self.add_input("brace_thicknesses", val=np.ones((n_bays)) * 0.1, units="m")
+
+        self.add_input("wind_reference_height", val=90.0, units="m")
+        self.add_input("shearExp", val=0.2)
+        self.add_input("z0", val=0.0, units="m")
+        self.add_input("rho_air", val=1.225, units="kg/m**3")
+        self.add_input("mu_air", val=1.81206e-5, units="kg/m/s")
+        self.add_input("beta_wind", val=0.0, units="deg")
+        self.add_input("cd_usr", val=-1.0)
+
+        for k in range(n_dlc):
+            lc = "" if n_dlc == 1 else str(k + 1)
+            self.add_input(f"Uref{lc}", val=0.0, units="m/s")
+
+        self.add_output("jacket_elem_Px1", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Px2", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Py1", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Py2", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Pz1", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Pz2", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_qdyn_wind", np.zeros((n_elem, n_dlc)), units="Pa")
+
+    def compute(self, inputs, outputs):
+        mod_opt = self.options["modeling_options"]
+        n_dlc = mod_opt["WISDEM"]["n_dlc"]
+        n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
+        n_elem = jacket_n_elem(n_legs, n_bays, mud_brace)
+        n_struct = n_elem - n_legs
+
+        joint1, joint2, diameters = build_jacket_element_geometry(
+            inputs["leg_nodes"],
+            inputs["bay_nodes"],
+            inputs["leg_diameter"],
+            inputs["leg_thickness"],
+            inputs["brace_diameters"],
+            inputs["brace_thicknesses"],
+            n_legs,
+            n_bays,
+            mud_brace,
+        )
+
+        zref = float(np.asarray(inputs["wind_reference_height"]).flatten()[0])
+        z0 = float(np.asarray(inputs["z0"]).flatten()[0])
+        shear_exp = float(np.asarray(inputs["shearExp"]).flatten()[0])
+        rho_air = float(np.asarray(inputs["rho_air"]).flatten()[0])
+        mu_air = float(np.asarray(inputs["mu_air"]).flatten()[0])
+        beta_wind = float(np.asarray(inputs["beta_wind"]).flatten()[0])
+        cd_usr = float(np.asarray(inputs["cd_usr"]).flatten()[0])
+
+        px1 = np.zeros((n_elem, n_dlc))
+        px2 = np.zeros((n_elem, n_dlc))
+        py1 = np.zeros((n_elem, n_dlc))
+        py2 = np.zeros((n_elem, n_dlc))
+        pz1 = np.zeros((n_elem, n_dlc))
+        pz2 = np.zeros((n_elem, n_dlc))
+        qdyn = np.zeros((n_elem, n_dlc))
+
+        for k in range(n_dlc):
+            lc = "" if n_dlc == 1 else str(k + 1)
+            uref = float(np.asarray(inputs[f"Uref{lc}"]).flatten()[0])
+
+            for ie in range(n_struct):
+                xyz0 = joint1[ie]
+                xyz1 = joint2[ie]
+                dval = diameters[ie]
+                z_nodes = np.array([xyz0[2], xyz1[2]])
+                u_nodes = _power_wind_speed(uref, zref, z_nodes, z0, shear_exp)
+
+                px_g = np.zeros(2)
+                py_g = np.zeros(2)
+                pz_g = np.zeros(2)
+                q_nodes = np.zeros(2)
+                for inode in range(2):
+                    px_g[inode], py_g[inode], pz_g[inode], q_nodes[inode] = _global_wind_line_loads(
+                        u_nodes[inode], dval, rho_air, mu_air, beta_wind, cd_usr
+                    )
+
+                px_loc = np.zeros(2)
+                py_loc = np.zeros(2)
+                pz_loc = np.zeros(2)
+                for inode in range(2):
+                    px_loc[inode], py_loc[inode], pz_loc[inode] = _global_to_member_loads(
+                        xyz0, xyz1, px_g[inode], py_g[inode], pz_g[inode]
+                    )
+
+                px1[ie, k] = px_loc[0]
+                px2[ie, k] = px_loc[1]
+                py1[ie, k] = py_loc[0]
+                py2[ie, k] = py_loc[1]
+                pz1[ie, k] = pz_loc[0]
+                pz2[ie, k] = pz_loc[1]
+                qdyn[ie, k] = 0.5 * (q_nodes[0] + q_nodes[1])
+
+        outputs["jacket_elem_Px1"] = px1
+        outputs["jacket_elem_Px2"] = px2
+        outputs["jacket_elem_Py1"] = py1
+        outputs["jacket_elem_Py2"] = py2
+        outputs["jacket_elem_Pz1"] = pz1
+        outputs["jacket_elem_Pz2"] = pz2
+        outputs["jacket_elem_qdyn_wind"] = qdyn
+
+
+class JacketHydroLoads(om.ExplicitComponent):
+    """
+    Distributed hydrodynamic loads on jacket members using the monopile MemberLoads physics
+    (Airy wave kinematics, Morrison's equation, global-to-member rotation).
+    """
+
+    def initialize(self):
+        self.options.declare("modeling_options")
+
+    def setup(self):
+        mod_opt = self.options["modeling_options"]
+        n_dlc = mod_opt["WISDEM"]["n_dlc"]
+        n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
+        n_elem = jacket_n_elem(n_legs, n_bays, mud_brace)
+
+        self.add_input("leg_nodes", val=np.zeros((n_legs, n_bays + 2, 3)), units="m")
+        self.add_input("bay_nodes", val=np.zeros((n_legs, n_bays + 1, 3)), units="m")
+        self.add_input("leg_diameter", val=1.4, units="m")
+        self.add_input("leg_thickness", val=0.1, units="m")
+        self.add_input("brace_diameters", val=np.ones((n_bays)), units="m")
+        self.add_input("brace_thicknesses", val=np.ones((n_bays)) * 0.1, units="m")
+
+        self.add_input("water_depth", val=0.0, units="m")
+        self.add_input("rho_water", val=1025.0, units="kg/m**3")
+        self.add_input("mu_water", val=1.08e-3, units="kg/(m*s)")
+        self.add_input("Hsig_wave", val=0.0, units="m")
+        self.add_input("Tsig_wave", val=0.0, units="s")
+        self.add_input("Uc", val=0.0, units="m/s")
+        self.add_input("beta_wave", val=0.0, units="deg")
+        self.add_input("ca_usr", val=-1.0)
+        self.add_input("cd_usr", val=-1.0)
+
+        self.add_output("jacket_elem_Px1_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Px2_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Py1_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Py2_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Pz1_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_Pz2_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+        self.add_output("jacket_elem_qdyn_hydro", np.zeros((n_elem, n_dlc)), units="Pa")
+
+    def compute(self, inputs, outputs):
+        mod_opt = self.options["modeling_options"]
+        n_dlc = mod_opt["WISDEM"]["n_dlc"]
+        n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
+        n_elem = jacket_n_elem(n_legs, n_bays, mud_brace)
+        n_struct = n_elem - n_legs
+
+        joint1, joint2, diameters = build_jacket_element_geometry(
+            inputs["leg_nodes"],
+            inputs["bay_nodes"],
+            inputs["leg_diameter"],
+            inputs["leg_thickness"],
+            inputs["brace_diameters"],
+            inputs["brace_thicknesses"],
+            n_legs,
+            n_bays,
+            mud_brace,
+        )
+
+        water_depth = float(np.asarray(inputs["water_depth"]).flatten()[0])
+        rho_water = float(np.asarray(inputs["rho_water"]).flatten()[0])
+        mu_water = float(np.asarray(inputs["mu_water"]).flatten()[0])
+        hsig = float(np.asarray(inputs["Hsig_wave"]).flatten()[0])
+        tsig = float(np.asarray(inputs["Tsig_wave"]).flatten()[0])
+        uc = float(np.asarray(inputs["Uc"]).flatten()[0])
+        beta_wave = float(np.asarray(inputs["beta_wave"]).flatten()[0])
+        ca_usr = float(np.asarray(inputs["ca_usr"]).flatten()[0])
+        cd_usr = float(np.asarray(inputs["cd_usr"]).flatten()[0])
+
+        px1 = np.zeros((n_elem, n_dlc))
+        px2 = np.zeros((n_elem, n_dlc))
+        py1 = np.zeros((n_elem, n_dlc))
+        py2 = np.zeros((n_elem, n_dlc))
+        pz1 = np.zeros((n_elem, n_dlc))
+        pz2 = np.zeros((n_elem, n_dlc))
+        qdyn = np.zeros((n_elem, n_dlc))
+
+        for k in range(n_dlc):
+            for ie in range(n_struct):
+                xyz0 = joint1[ie]
+                xyz1 = joint2[ie]
+                dval = diameters[ie]
+                z_nodes = np.array([xyz0[2], xyz1[2]])
+                u_nodes, a_nodes, p_nodes = _linear_wave_kinematics(
+                    z_nodes, water_depth, hsig, tsig, uc, rho_water
+                )
+
+                px_g = np.zeros(2)
+                py_g = np.zeros(2)
+                pz_g = np.zeros(2)
+                q_nodes = np.zeros(2)
+                for inode in range(2):
+                    px_g[inode], py_g[inode], pz_g[inode], q_nodes[inode] = _global_wave_line_loads(
+                        u_nodes[inode],
+                        a_nodes[inode],
+                        p_nodes[inode],
+                        dval,
+                        rho_water,
+                        mu_water,
+                        beta_wave,
+                        ca_usr,
+                        cd_usr,
+                    )
+
+                px_loc = np.zeros(2)
+                py_loc = np.zeros(2)
+                pz_loc = np.zeros(2)
+                for inode in range(2):
+                    px_loc[inode], py_loc[inode], pz_loc[inode] = _global_to_member_loads(
+                        xyz0, xyz1, px_g[inode], py_g[inode], pz_g[inode]
+                    )
+
+                px1[ie, k] = px_loc[0]
+                px2[ie, k] = px_loc[1]
+                py1[ie, k] = py_loc[0]
+                py2[ie, k] = py_loc[1]
+                pz1[ie, k] = pz_loc[0]
+                pz2[ie, k] = pz_loc[1]
+                qdyn[ie, k] = 0.5 * (q_nodes[0] + q_nodes[1])
+
+        outputs["jacket_elem_Px1_hydro"] = px1
+        outputs["jacket_elem_Px2_hydro"] = px2
+        outputs["jacket_elem_Py1_hydro"] = py1
+        outputs["jacket_elem_Py2_hydro"] = py2
+        outputs["jacket_elem_Pz1_hydro"] = pz1
+        outputs["jacket_elem_Pz2_hydro"] = pz2
+        outputs["jacket_elem_qdyn_hydro"] = qdyn
+
+
+class JacketMemberLoadSum(om.ExplicitComponent):
+    """Sum distributed wind and hydrodynamic jacket member loads."""
+
+    def initialize(self):
+        self.options.declare("modeling_options")
+
+    def setup(self):
+        mod_opt = self.options["modeling_options"]
+        n_dlc = mod_opt["WISDEM"]["n_dlc"]
+        n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
+        n_elem = jacket_n_elem(n_legs, n_bays, mud_brace)
+        fb_opt = mod_opt["WISDEM"]["FixedBottomSE"]
+        member_wind = fb_opt.get("member_wind", False)
+        member_hydro = fb_opt.get("member_hydro", False)
+
+        for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+            if member_wind:
+                self.add_input(f"jacket_elem_{var}_wind", np.zeros((n_elem, n_dlc)), units="N/m")
+            if member_hydro:
+                self.add_input(f"jacket_elem_{var}_hydro", np.zeros((n_elem, n_dlc)), units="N/m")
+            self.add_output(f"jacket_elem_{var}", np.zeros((n_elem, n_dlc)), units="N/m")
+
+        if member_wind:
+            self.add_input("jacket_elem_qdyn_wind", np.zeros((n_elem, n_dlc)), units="Pa")
+        if member_hydro:
+            self.add_input("jacket_elem_qdyn_hydro", np.zeros((n_elem, n_dlc)), units="Pa")
+        self.add_output("jacket_elem_qdyn", np.zeros((n_elem, n_dlc)), units="Pa")
+
+        self.member_wind = member_wind
+        self.member_hydro = member_hydro
+
+    def compute(self, inputs, outputs):
+        for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+            total = np.zeros_like(outputs[f"jacket_elem_{var}"])
+            if self.member_wind:
+                total += inputs[f"jacket_elem_{var}_wind"]
+            if self.member_hydro:
+                total += inputs[f"jacket_elem_{var}_hydro"]
+            outputs[f"jacket_elem_{var}"] = total
+
+        qdyn = np.zeros_like(outputs["jacket_elem_qdyn"])
+        if self.member_wind:
+            qdyn += inputs["jacket_elem_qdyn_wind"]
+        if self.member_hydro:
+            qdyn += inputs["jacket_elem_qdyn_hydro"]
+        outputs["jacket_elem_qdyn"] = qdyn
 
 
 class PreDiscretization(om.ExplicitComponent):
@@ -211,6 +677,15 @@ class ComputeFrame3DD(om.ExplicitComponent):
         self.add_input("turbine_cg", val=np.zeros(3), units="m")
         self.add_input("turbine_I", np.zeros(6), units="kg*m**2")
 
+        n_elem = jacket_n_elem(n_legs, n_bays, x_mb)
+        member_wind = mod_opt["WISDEM"]["FixedBottomSE"].get("member_wind", False)
+        member_hydro = mod_opt["WISDEM"]["FixedBottomSE"].get("member_hydro", False)
+        member_loads = member_wind or member_hydro
+        if member_loads:
+            for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+                self.add_input(f"jacket_elem_{var}", np.zeros((n_elem, n_dlc)), units="N/m")
+            self.add_input("jacket_elem_qdyn_member", np.zeros((n_elem, n_dlc)), units="Pa")
+
         n_node = 3 * n_legs * (n_bays + 1) + 1
         self.add_output("jacket_nodes", np.zeros((n_node, 3)), units="m")
         self.add_output("leg_indices", np.zeros(n_legs))
@@ -261,6 +736,9 @@ class ComputeFrame3DD(om.ExplicitComponent):
         n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
         x_mb = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
         material_name = mod_opt["WISDEM"]["FixedBottomSE"]["material"]
+        member_wind = mod_opt["WISDEM"]["FixedBottomSE"].get("member_wind", False)
+        member_hydro = mod_opt["WISDEM"]["FixedBottomSE"].get("member_hydro", False)
+        member_loads = member_wind or member_hydro
 
         leg_nodes = inputs["leg_nodes"]
         bay_nodes = inputs["bay_nodes"]
@@ -438,7 +916,13 @@ class ComputeFrame3DD(om.ExplicitComponent):
         outputs["jacket_elem_G"] = G
         outputs["jacket_elem_rho"] = rho
         outputs["jacket_elem_sigma_y"] = inputs["sigma_y_mat"][imat]
-        outputs["jacket_elem_qdyn"] = 1.0e2  # hardcoded value for now
+        member_wind = mod_opt["WISDEM"]["FixedBottomSE"].get("member_wind", False)
+        member_hydro = mod_opt["WISDEM"]["FixedBottomSE"].get("member_hydro", False)
+        member_loads = member_wind or member_hydro
+        if member_loads:
+            outputs["jacket_elem_qdyn"] = inputs["jacket_elem_qdyn_member"]
+        else:
+            outputs["jacket_elem_qdyn"] = 1.0e2  # hardcoded value for now
         outputs["jacket_elem_sigma_y"][-n_legs:] *= 1e6
         outputs["jacket_elem_qdyn"][-n_legs:] *= 1e4
 
@@ -501,16 +985,18 @@ class ComputeFrame3DD(om.ExplicitComponent):
                 np.array([turb_M[2]]).flatten(),
             )
 
-            # # trapezoidally distributed loads
-            # xx1 = xy1 = xz1 = np.zeros(ielem.size)
-            # xx2 = xy2 = xz2 = 0.99 * L  # multiply slightly less than unity b.c. of precision
-            # wx1 = inputs["jacket_elem_Px1"][:nelem, k]
-            # wx2 = inputs["jacket_elem_Px2"][:nelem, k]
-            # wy1 = inputs["jacket_elem_Py1"][:nelem, k]
-            # wy2 = inputs["jacket_elem_Py2"][:nelem, k]
-            # wz1 = inputs["jacket_elem_Pz1"][:nelem, k]
-            # wz2 = inputs["jacket_elem_Pz2"][:nelem, k]
-            # load_obj.changeTrapezoidalLoads(ielem, xx1, xx2, wx1, wx2, xy1, xy2, wy1, wy2, xz1, xz2, wz1, wz2)
+            if member_loads:
+                nelem = self.num_elements - n_legs
+                ielem = element[:nelem]
+                xx1 = xy1 = xz1 = np.zeros(nelem)
+                xx2 = xy2 = xz2 = 0.99 * L[:nelem]
+                wx1 = inputs["jacket_elem_Px1"][:nelem, k]
+                wx2 = inputs["jacket_elem_Px2"][:nelem, k]
+                wy1 = inputs["jacket_elem_Py1"][:nelem, k]
+                wy2 = inputs["jacket_elem_Py2"][:nelem, k]
+                wz1 = inputs["jacket_elem_Pz1"][:nelem, k]
+                wz2 = inputs["jacket_elem_Pz2"][:nelem, k]
+                load_obj.changeTrapezoidalLoads(ielem, xx1, xx2, wx1, wx2, xy1, xy2, wy1, wy2, xz1, xz2, wz1, wz2)
 
             # Add the load case and run
             self.frame.addLoadCase(load_obj)
@@ -828,8 +1314,74 @@ class JacketSEPerf(om.Group):
 
     def setup(self):
         modeling_options = self.options["modeling_options"]
+        fb_opt = modeling_options["WISDEM"]["FixedBottomSE"]
+        member_wind = fb_opt.get("member_wind", False)
+        member_hydro = fb_opt.get("member_hydro", False)
+        member_loads = member_wind or member_hydro
+
+        if member_wind:
+            wind_prom = [
+                "leg_nodes",
+                "bay_nodes",
+                "leg_diameter",
+                "leg_thickness",
+                "brace_diameters",
+                "brace_thicknesses",
+                "wind_reference_height",
+                "shearExp",
+                "z0",
+                "rho_air",
+                "mu_air",
+                "beta_wind",
+                "cd_usr",
+            ]
+            n_dlc = modeling_options["WISDEM"]["n_dlc"]
+            for k in range(n_dlc):
+                lc = "" if n_dlc == 1 else str(k + 1)
+                wind_prom.append(f"Uref{lc}")
+
+            self.add_subsystem("windloads", JacketWindLoads(modeling_options=modeling_options), promotes=wind_prom)
+
+        if member_hydro:
+            hydro_prom = [
+                "leg_nodes",
+                "bay_nodes",
+                "leg_diameter",
+                "leg_thickness",
+                "brace_diameters",
+                "brace_thicknesses",
+                "water_depth",
+                "rho_water",
+                "mu_water",
+                "Hsig_wave",
+                "Tsig_wave",
+                "Uc",
+                "beta_wave",
+                "ca_usr",
+                "cd_usr",
+            ]
+            self.add_subsystem("hydroloads", JacketHydroLoads(modeling_options=modeling_options), promotes=hydro_prom)
 
         self.add_subsystem("frame3dd", ComputeFrame3DD(modeling_options=modeling_options), promotes=["*"])
+
+        if member_wind and member_hydro:
+            self.add_subsystem("memberloads", JacketMemberLoadSum(modeling_options=modeling_options))
+            for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+                self.connect(f"windloads.jacket_elem_{var}", f"memberloads.jacket_elem_{var}_wind")
+                self.connect(f"hydroloads.jacket_elem_{var}_hydro", f"memberloads.jacket_elem_{var}_hydro")
+                self.connect(f"memberloads.jacket_elem_{var}", f"jacket_elem_{var}")
+            self.connect("windloads.jacket_elem_qdyn_wind", "memberloads.jacket_elem_qdyn_wind")
+            self.connect("hydroloads.jacket_elem_qdyn_hydro", "memberloads.jacket_elem_qdyn_hydro")
+            self.connect("memberloads.jacket_elem_qdyn", "jacket_elem_qdyn_member")
+        elif member_wind:
+            for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+                self.connect(f"windloads.jacket_elem_{var}", f"jacket_elem_{var}")
+            self.connect("windloads.jacket_elem_qdyn_wind", "jacket_elem_qdyn_member")
+        elif member_hydro:
+            for var in ["Px1", "Px2", "Py1", "Py2", "Pz1", "Pz2"]:
+                self.connect(f"hydroloads.jacket_elem_{var}_hydro", f"jacket_elem_{var}")
+            self.connect("hydroloads.jacket_elem_qdyn_hydro", "jacket_elem_qdyn_member")
+
         self.add_subsystem("post", JacketPost(modeling_options=modeling_options), promotes=["*"])
         self.add_subsystem("cost", JacketCost(modeling_options=modeling_options), promotes=["*"])
 

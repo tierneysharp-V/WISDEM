@@ -339,6 +339,14 @@ properties:
                         type: boolean
                         default: False
                         description: If true, save .pngs of the jacket truss during analysis or optimization. Jacket only.
+                    member_wind:
+                        type: boolean
+                        default: False
+                        description: If true, apply distributed wind drag loads to jacket members (legs and braces).
+                    member_hydro:
+                        type: boolean
+                        default: False
+                        description: If true, apply distributed hydrodynamic loads from waves to submerged jacket members.
                     rank_and_file: *rank_and_file
             BOS:
                 type: object

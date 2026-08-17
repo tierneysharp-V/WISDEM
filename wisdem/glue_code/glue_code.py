@@ -622,6 +622,17 @@ class WT_RNTA(om.Group):
         if modeling_options["flags"]["jacket"]:
             self.connect("env.water_depth", "fixedse.water_depth")
             self.connect("env.Hsig_wave", "fixedse.Hsig_wave")
+            if modeling_options["WISDEM"]["FixedBottomSE"].get("member_wind", False):
+                if modeling_options["flags"]["blade"]:
+                    self.connect("rotorse.rp.gust.V_gust", "fixedse.Uref")
+                self.connect("high_level_tower_props.hub_height", "fixedse.wind_reference_height")
+                self.connect("env.rho_air", "fixedse.rho_air")
+                self.connect("env.mu_air", "fixedse.mu_air")
+                self.connect("env.shear_exp", "fixedse.shearExp")
+            if modeling_options["WISDEM"]["FixedBottomSE"].get("member_hydro", False):
+                self.connect("env.rho_water", "fixedse.rho_water")
+                self.connect("env.mu_water", "fixedse.mu_water")
+                self.connect("env.Tsig_wave", "fixedse.Tsig_wave")
             self.connect("jacket.transition_piece_cost", "fixedse.transition_piece_cost")
             self.connect("jacket.transition_piece_mass", "fixedse.transition_piece_mass")
             self.connect("jacket.foot_head_ratio", "fixedse.foot_head_ratio")

@@ -55,11 +55,11 @@ constraints:
             flag: False
             lower_bound: 0.13
             upper_bound: 0.20
-        # Practical batter: (r_foot - r_head) / height ∈ [0.1, 0.15]
+        # Practical batter: (r_foot - r_head) / height ∈ [0.1, 1.0]
         flare:
             flag: True
             lower_bound: 0.1
-            upper_bound: 0.15
+            upper_bound: 1.0
         tower_diameter_coupling:
             flag: True
         # Freeboard pre-set by conceptual design rules
