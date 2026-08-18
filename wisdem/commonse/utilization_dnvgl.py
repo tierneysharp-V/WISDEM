@@ -28,6 +28,7 @@ class CylinderBuckling:
         sigma_y=345e6,
         gamma=0.0,
         mod_length=0.0,
+        k=2.0,
         **kwargs,
     ):
         """
@@ -58,6 +59,11 @@ class CylinderBuckling:
             Default: 345e6
         gamma : int | float
             Material partial safety factor.
+        k : float or array
+            Effective length factor for global column buckling. Scalar applies to
+            the summed member length (tower/monopile segments). An array with one
+            value per section uses each section length independently (jacket truss).
+            Default: 2.0 (fixed-free).
         """
 
         self._l = np.array(l)
@@ -68,6 +74,7 @@ class CylinderBuckling:
         self.sigma_y = sigma_y
         self.gamma = gamma
         self.mod_length = mod_length
+        self.k = k
 
         self.A = kwargs.get("A", np.zeros(len(self.t)))
         self.I = kwargs.get("I", np.zeros(len(self.t)))
@@ -343,9 +350,18 @@ class CylinderBuckling:
         sigma_a = np.abs(np.minimum(_sigma_a, 0.0))
         # sigma_h = np.abs(np.minimum(_sigma_h, 0.0))
 
-        # Euler buckling strength
-        k = 2.0  # Fixed-free
-        L = self._l.sum() - self.mod_length
+        # Euler buckling strength — scalar k uses total stacked length; array k is per member
+        k = np.asarray(self.k, dtype=float)
+        if k.ndim == 0 or k.size == 1:
+            k = float(k.flatten()[0])
+            L = self._l.sum() - self.mod_length
+        else:
+            k = k.flatten()
+            if k.size != self._l.size:
+                raise ValueError(
+                    f"Effective length factor k size {k.size} must match section count {self._l.size}"
+                )
+            L = self._l - self.mod_length
 
         fE = (np.pi**2 * self.E * self.Ic) / ((k * L) ** 2 * self.Ac)
 

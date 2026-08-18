@@ -5,10 +5,26 @@ import openmdao.api as om
 #import numpy.testing as npt
 
 #from wisdem.commonse import gravity as g
-from wisdem.fixed_bottomse.jacket import JacketSE
+from wisdem.fixed_bottomse.jacket import JacketSE, jacket_element_metadata, jacket_n_elem, jacket_global_buckling_k_factors
 
 
 class Test(unittest.TestCase):
+    def test_element_metadata_count(self):
+        for n_legs, n_bays, mud in ((3, 2, True), (4, 3, True), (4, 3, False)):
+            n_struct = jacket_n_elem(n_legs, n_bays, mud) - n_legs
+            meta = jacket_element_metadata(n_legs, n_bays, mud)
+            self.assertEqual(len(meta), n_struct)
+            self.assertTrue(all(m["member_type"] in ("leg", "brace") for m in meta))
+
+    def test_global_buckling_k_factors(self):
+        k = jacket_global_buckling_k_factors(4, 3, True)
+        meta = jacket_element_metadata(4, 3, True)
+        for ki, m in zip(k, meta):
+            if m["member_type"] == "leg":
+                self.assertAlmostEqual(ki, 1.0)
+            else:
+                self.assertAlmostEqual(ki, 0.8)
+
     def testAll(self):
         modeling_options = {}
         modeling_options["WISDEM"] = {}

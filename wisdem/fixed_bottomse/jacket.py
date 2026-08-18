@@ -27,9 +27,97 @@ from wisdem.commonse.utilities import cosd, sind
 from wisdem.commonse.wind_wave_drag import cylinderDrag
 
 
+# DNVGL global column buckling effective length factors (per Frame3DD element)
+JACKET_GLOBAL_BUCKLING_K_LEG = 1.0
+JACKET_GLOBAL_BUCKLING_K_BRACE = 0.8
+
+
 def jacket_n_elem(n_legs, n_bays, mud_brace):
     """Number of Frame3DD elements in the jacket truss (including ghost members)."""
     return 2 * (n_legs * (n_bays + 1)) + 4 * (n_legs * n_bays) + int(mud_brace) * n_legs + n_legs
+
+
+def jacket_element_metadata(n_legs, n_bays, mud_brace):
+    """
+    Descriptive metadata for each structural jacket element (ghost members excluded).
+
+    Element ordering matches ``build_jacket_element_geometry`` / ``ComputeFrame3DD``.
+    """
+    meta = []
+    brace_quadrants = ("NW", "NE", "SW", "SE")
+
+    for jdx in range(n_bays + 1):
+        for idx in range(n_legs):
+            leg = idx + 1
+            meta.append(
+                {
+                    "elem_idx": len(meta),
+                    "member_type": "leg",
+                    "leg": leg,
+                    "bay": jdx,
+                    "segment": "lower",
+                    "label": f"leg{leg}_bay{jdx}_lower",
+                }
+            )
+            meta.append(
+                {
+                    "elem_idx": len(meta),
+                    "member_type": "leg",
+                    "leg": leg,
+                    "bay": jdx,
+                    "segment": "upper",
+                    "label": f"leg{leg}_bay{jdx}_upper",
+                }
+            )
+
+    for jdx in range(n_bays):
+        for idx in range(n_legs):
+            leg = idx + 1
+            for quadrant in brace_quadrants:
+                meta.append(
+                    {
+                        "elem_idx": len(meta),
+                        "member_type": "brace",
+                        "leg": leg,
+                        "bay": jdx,
+                        "quadrant": quadrant,
+                        "label": f"brace_leg{leg}_bay{jdx}_{quadrant}",
+                    }
+                )
+
+    if mud_brace:
+        for idx in range(n_legs):
+            leg = idx + 1
+            meta.append(
+                {
+                    "elem_idx": len(meta),
+                    "member_type": "brace",
+                    "leg": leg,
+                    "bay": 0,
+                    "segment": "mud",
+                    "label": f"mud_brace_leg{leg}_to_leg{(leg % n_legs) + 1}",
+                }
+            )
+
+    n_struct = jacket_n_elem(n_legs, n_bays, mud_brace) - n_legs
+    if len(meta) != n_struct:
+        raise ValueError(f"jacket_element_metadata count {len(meta)} != structural elements {n_struct}")
+    return meta
+
+
+def jacket_global_buckling_k_factors(
+    n_legs,
+    n_bays,
+    mud_brace,
+    k_leg=JACKET_GLOBAL_BUCKLING_K_LEG,
+    k_brace=JACKET_GLOBAL_BUCKLING_K_BRACE,
+):
+    """Per-element effective length factor k for jacket global buckling (ghost members excluded)."""
+    meta = jacket_element_metadata(n_legs, n_bays, mud_brace)
+    k = np.empty(len(meta), dtype=float)
+    for i, m in enumerate(meta):
+        k[i] = k_leg if m["member_type"] == "leg" else k_brace
+    return k
 
 
 def build_jacket_element_geometry(
@@ -1116,6 +1204,8 @@ class JacketPost(om.ExplicitComponent):
         mod_opt = self.options["modeling_options"]
         n_dlc = mod_opt["WISDEM"]["n_dlc"]
         n_legs = mod_opt["WISDEM"]["FixedBottomSE"]["n_legs"]
+        n_bays = mod_opt["WISDEM"]["FixedBottomSE"]["n_bays"]
+        mud_brace = mod_opt["WISDEM"]["FixedBottomSE"]["mud_brace"]
         gamma_f = mod_opt["WISDEM"]["FixedBottomSE"]["gamma_f"]
         gamma_m = mod_opt["WISDEM"]["FixedBottomSE"]["gamma_m"]
         gamma_n = mod_opt["WISDEM"]["FixedBottomSE"]["gamma_n"]
@@ -1154,8 +1244,12 @@ class JacketPost(om.ExplicitComponent):
             axial_stress, hoop_stress, shear_stress, gamma_f * gamma_m * gamma_n, sigy.reshape((-1, 1))
         )[:-n_legs]
 
-        # Use DNV-GL CP202 Method
-        check = util_dnvgl.CylinderBuckling(h, d, t, E=E, G=G, sigma_y=sigy, gamma=gamma_f * gamma_b)
+        # Use DNV-GL CP202 Method; per-element k (legs/braces) and member length for global buckling
+        k_struct = jacket_global_buckling_k_factors(n_legs, n_bays, mud_brace)
+        k_factors = np.concatenate([k_struct, np.full(n_legs, JACKET_GLOBAL_BUCKLING_K_LEG)])
+        check = util_dnvgl.CylinderBuckling(
+            h, d, t, E=E, G=G, sigma_y=sigy, gamma=gamma_f * gamma_b, k=k_factors
+        )
         for k in range(n_dlc):
             results = check.run_buckling_checks(
                 Fz[:, k], M[:, k], axial_stress[:, k], hoop_stress[:, k], shear_stress[:, k]

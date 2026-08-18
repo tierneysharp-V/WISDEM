@@ -45,7 +45,7 @@ constraints:
         stress:
             flag: True
         global_buckling:
-            flag: False
+            flag: True
         shell_buckling:
             flag: True
         # Trial: enable frequency band (disable if optimisation becomes unstable)

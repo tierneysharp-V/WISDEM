@@ -89,12 +89,32 @@ DEFAULT_TURBINE_CSV = os.path.join(BATCH_DIR, "turbine_lookup.csv")
 
 STAGE1_MAX_ITER = 50
 _WARMSTART_MAX_UTIL = 1.05
+_PREFLIGHT_GLOBAL_BUCK_TARGET = 2.0  # preflight tries to reduce global buckling util below this
 _RATING_MATCH_RTOL = 1e-6
 _RATING_MATCH_ATOL = 1.0  # Watts
 
 # Early-design parked rotor: feathered blades as a low-Cd disk (not IEC DLC 6.x)
 PARKED_ROTOR_CD = 0.04
 _G = 9.80665
+
+
+def _ensure_wisdem_namespace():
+    """
+    Register a minimal ``wisdem`` package before loading repo .py files.
+
+    Blocks execution of ``wisdem/__init__.py`` (which imports runWISDEM → glue_code
+    → JacketSE while jacket.py is still loading). Subpackages (commonse, etc.) are
+    loaded normally from ``wisdem.__path__``.
+    """
+    import types
+
+    if "wisdem" in sys.modules:
+        return
+    wisdem_root = os.path.join(REPO_ROOT, "wisdem")
+    mod = types.ModuleType("wisdem")
+    mod.__path__ = [wisdem_root]
+    mod.__package__ = "wisdem"
+    sys.modules["wisdem"] = mod
 
 
 def _load_repo_module(qualname: str, relpath: str):
@@ -109,8 +129,38 @@ def _load_repo_module(qualname: str, relpath: str):
     return mod
 
 
+def _apply_repo_module_to_package(repo_mod, qualname: str):
+    """Bind a repo-loaded module onto the installed wisdem package namespace."""
+    if repo_mod is None:
+        return None
+    pkg = sys.modules.get(qualname)
+    if pkg is None or pkg is repo_mod:
+        sys.modules[qualname] = repo_mod
+        return repo_mod
+    for name in dir(repo_mod):
+        if name.startswith("__"):
+            continue
+        setattr(pkg, name, getattr(repo_mod, name))
+    sys.modules[qualname] = pkg
+    return pkg
+
+
 def _setup_wisdem():
-    from wisdem import run_wisdem as _run_wisdem_installed  # noqa: F401
+    import inspect
+
+    _ensure_wisdem_namespace()
+
+    # Load repo Python overrides BEFORE wisdem/__init__.py (runWISDEM → glue_code → jacket).
+    dnvgl_mod = _load_repo_module(
+        "wisdem.commonse.utilization_dnvgl",
+        os.path.join("wisdem", "commonse", "utilization_dnvgl.py"),
+    )
+    jacket_mod = _load_repo_module("wisdem.fixed_bottomse.jacket", os.path.join("wisdem", "fixed_bottomse", "jacket.py"))
+    _load_repo_module(
+        "wisdem.fixed_bottomse.conceptual_design_rules",
+        os.path.join("wisdem", "fixed_bottomse", "conceptual_design_rules.py"),
+    )
+    _load_repo_module("wisdem.fixed_bottomse.monopile", os.path.join("wisdem", "fixed_bottomse", "monopile.py"))
 
     val = _load_repo_module("wisdem.inputs.validation", os.path.join("wisdem", "inputs", "validation.py"))
     if val is not None:
@@ -119,12 +169,6 @@ def _setup_wisdem():
         for name in dir(val):
             if not name.startswith("_"):
                 setattr(inputs_pkg, name, getattr(val, name))
-    _load_repo_module(
-        "wisdem.fixed_bottomse.conceptual_design_rules",
-        os.path.join("wisdem", "fixed_bottomse", "conceptual_design_rules.py"),
-    )
-    _load_repo_module("wisdem.fixed_bottomse.jacket", os.path.join("wisdem", "fixed_bottomse", "jacket.py"))
-    _load_repo_module("wisdem.fixed_bottomse.monopile", os.path.join("wisdem", "fixed_bottomse", "monopile.py"))
     _load_repo_module("wisdem.glue_code.gc_WT_DataStruc", os.path.join("wisdem", "glue_code", "gc_WT_DataStruc.py"))
     _load_repo_module("wisdem.glue_code.gc_WT_InitModel", os.path.join("wisdem", "glue_code", "gc_WT_InitModel.py"))
     _load_repo_module("wisdem.glue_code.gc_LoadInputs", os.path.join("wisdem", "glue_code", "gc_LoadInputs.py"))
@@ -141,6 +185,29 @@ def _setup_wisdem():
         import wisdem.glue_code.runWISDEM as run_wisdem_mod
 
         importlib.reload(run_wisdem_mod)
+
+    dnvgl_mod = _apply_repo_module_to_package(dnvgl_mod, "wisdem.commonse.utilization_dnvgl")
+    jacket_mod = _apply_repo_module_to_package(jacket_mod, "wisdem.fixed_bottomse.jacket")
+    if jacket_mod is not None:
+        fb_pkg = sys.modules.get("wisdem.fixed_bottomse")
+        if fb_pkg is not None:
+            fb_pkg.jacket = jacket_mod
+
+    if dnvgl_mod is not None:
+        sig = inspect.signature(dnvgl_mod.CylinderBuckling.__init__)
+        dnvgl_path = inspect.getfile(dnvgl_mod)
+        if "k" in sig.parameters:
+            print(f"  Active utilization_dnvgl: {dnvgl_path}")
+        else:
+            print(f"  WARNING: utilization_dnvgl at {dnvgl_path} has no per-member k parameter.")
+    if jacket_mod is not None and hasattr(jacket_mod, "JACKET_GLOBAL_BUCKLING_K_LEG"):
+        jpath = inspect.getfile(jacket_mod)
+        print(
+            f"  Active jacket.py: {jpath}\n"
+            "  Jacket global buckling k: "
+            f"legs={jacket_mod.JACKET_GLOBAL_BUCKLING_K_LEG}, "
+            f"braces={jacket_mod.JACKET_GLOBAL_BUCKLING_K_BRACE}"
+        )
     sys.path.insert(0, EXAMPLES_DIR)
     from extract_foundation_results import append_foundation_results  # noqa: E402
 
@@ -995,40 +1062,6 @@ def monopile_height_dv_enabled(analysis: dict) -> bool:
     )
 
 
-def patch_monopile_height_bounds(
-    analysis: dict, wt_geom: dict, modeling: dict, cdr
-) -> dict:
-    """Set height DV lower bound to H_free + L_emb,min; ensure min constraints are on."""
-    opts = copy.deepcopy(analysis)
-    mono_h = (
-        opts.setdefault("design_variables", {})
-        .setdefault("monopile", {})
-        .setdefault("height", {})
-    )
-    if not mono_h.get("flag", False):
-        return opts
-
-    site = cdr.resolve_site_params(modeling)
-    l_emb_min = cdr.embedment_length_from_wt(wt_geom, modeling)
-    h_min = site["H_free"] + l_emb_min
-    hi = float(mono_h.get("upper_bound", 150.0))
-    if h_min > hi:
-        raise ValueError(
-            f"Monopile height minimum {h_min:.3f} m exceeds DV upper_bound {hi:.3f} m"
-        )
-    mono_h["lower_bound"] = h_min
-
-    mono_c = opts.setdefault("constraints", {}).setdefault("monopile", {})
-    mono_c.setdefault("height_airgap", {})["flag"] = True
-    mono_c.setdefault("pile_depth", {})["flag"] = True
-
-    print(
-        f"  Monopile height DV: lower={h_min:.3f} m "
-        f"(H_free={site['H_free']:.3f} + L_emb,min={l_emb_min:.3f}), upper={hi:.3f} m"
-    )
-    return opts
-
-
 def extract_monopile_dt(wt_opt) -> tuple[float, float]:
     """Return (diameter_m, thickness_m) from an optimised problem."""
     diam = _as_float_list(wt_opt.get_val("monopile.diameter", units="m"))
@@ -1146,14 +1179,16 @@ def analysis_stage2_full(analysis: dict) -> dict:
 
 
 def analysis_jacket_stage1(analysis: dict) -> dict:
-    """Stage 1 jacket: keep YAML constraints, shorter iteration budget."""
+    """Stage 1 jacket: stress/shell/flare (global buckling off), shorter iteration budget."""
     opts = copy.deepcopy(analysis)
     opts.setdefault("driver", {}).setdefault("optimization", {})["max_iter"] = STAGE1_MAX_ITER
+    jacket_constr = opts.setdefault("constraints", {}).setdefault("jacket", {})
+    jacket_constr.setdefault("global_buckling", {})["flag"] = False
     return opts
 
 
 def analysis_jacket_stage2(analysis: dict) -> dict:
-    """Stage 2 jacket: keep YAML constraints, standard iteration budget."""
+    """Stage 2 jacket: full YAML constraints including global buckling."""
     return copy.deepcopy(analysis)
 
 
@@ -1227,6 +1262,74 @@ def max_strength_utilization(wt_opt) -> float:
         if np.isfinite(v):
             vals.append(v)
     return float(max(vals)) if vals else float("nan")
+
+
+def max_jacket_global_buckling_util(wt_opt) -> float:
+    """Peak jacket global buckling utilization (nan if unavailable)."""
+    for name in (
+        "fixedse.constr_global_buckling",
+        "fixedse.post.constr_global_buckling",
+    ):
+        v = _safe_get(wt_opt, name, reduce="max")
+        if np.isfinite(v):
+            return float(v)
+    return float("nan")
+
+
+def max_jacket_strength_util(wt_opt) -> float:
+    """Peak jacket stress / shell buckling utilization (excludes global buckling)."""
+    vals = []
+    for name in (
+        "fixedse.constr_stress",
+        "fixedse.constr_shell_buckling",
+        "fixedse.post.constr_stress",
+        "fixedse.post.constr_shell_buckling",
+    ):
+        v = _safe_get(wt_opt, name, reduce="max")
+        if np.isfinite(v):
+            vals.append(v)
+    return float(max(vals)) if vals else float("nan")
+
+
+def _jacket_preflight_scale(strength_util: float, global_buck: float) -> float:
+    """
+    Member size multiplier for jacket preflight repair.
+
+    Uses modest scaling for stress/shell, and more aggressive scaling when
+    global buckling utilization is very high.
+    """
+    scale = 1.0
+    if np.isfinite(strength_util) and strength_util > 1.0:
+        scale = max(scale, min(1.5, strength_util * 1.05))
+    if np.isfinite(global_buck) and global_buck > 1.0:
+        if global_buck >= 10.0:
+            g_scale = min(3.0, global_buck ** 0.35)
+        elif global_buck >= 3.0:
+            g_scale = min(2.0, global_buck ** 0.5)
+        else:
+            g_scale = min(1.5, global_buck * 1.05)
+        scale = max(scale, g_scale)
+    return scale
+
+
+def jacket_preflight_is_ready(
+    wt_opt,
+    f_lo: float,
+    f_hi: float,
+    check_frequency: bool = False,
+) -> bool:
+    """True when jacket preflight has stress/shell and global buckling roughly feasible."""
+    strength = max_jacket_strength_util(wt_opt)
+    global_buck = max_jacket_global_buckling_util(wt_opt)
+    if np.isfinite(strength) and strength > _WARMSTART_MAX_UTIL:
+        return False
+    if np.isfinite(global_buck) and global_buck > _PREFLIGHT_GLOBAL_BUCK_TARGET:
+        return False
+    if check_frequency:
+        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+        if not np.isfinite(f1) or f1 < f_lo or f1 > f_hi:
+            return False
+    return True
 
 
 def design_is_warmstart_safe(wt_opt, f_lo: float, f_hi: float, check_frequency: bool = True) -> bool:
@@ -1318,7 +1421,7 @@ _J_LEG_T_LO, _J_LEG_T_HI = 0.05, 0.1
 _J_BRACE_D_LO, _J_BRACE_D_HI = 0.5, 2.0
 _J_BRACE_T_LO, _J_BRACE_T_HI = 0.05, 0.1  # keep t < 0.5 * brace_D_lo
 _J_T_OVER_D_MAX = 0.45  # Tube Area → 0 when t >= D
-_J_FLARE_LO, _J_FLARE_HI = 0.1, 1.0  # (r_foot - r_head) / height
+_J_FLARE_LO, _J_FLARE_HI = 0.1, 0.15  # (r_foot - r_head) / height
 
 
 def repair_feasible_monopile_start(
@@ -1465,7 +1568,16 @@ def run_monopile_two_stage(
     return wt_opt, modeling_options, exit2, d2, t2
 
 
-def print_jacket_diagnostics(wt_opt, label: str, f_lo: float, f_hi: float, exit_mode=None) -> None:
+def print_jacket_diagnostics(
+    wt_opt,
+    label: str,
+    f_lo: float,
+    f_hi: float,
+    exit_mode=None,
+    modeling_options: dict | None = None,
+    member_diagnostics: bool = False,
+    buckling_util_threshold: float = 1.0,
+) -> None:
     """Log jacket exit mode, geometry, mass, f1 and peak utilizations."""
     r_head = _safe_get(wt_opt, "jacket.r_head", units="m")
     r_foot = _safe_get(wt_opt, "fixedse.r_foot", units="m")
@@ -1487,6 +1599,207 @@ def print_jacket_diagnostics(wt_opt, label: str, f_lo: float, f_hi: float, exit_
         f"  [{label}] max util: stress={stress:.3f}  global_buck={buck_g:.3f}  "
         f"shell_buck={buck_s:.3f}"
     )
+    if member_diagnostics and modeling_options is not None:
+        if np.isfinite(buck_g) and buck_g >= buckling_util_threshold:
+            print_jacket_member_buckling_diagnostics(
+                wt_opt,
+                modeling_options,
+                label=label,
+                util_threshold=buckling_util_threshold,
+            )
+        elif member_diagnostics:
+            print(
+                f"  [{label}] member diagnostics skipped "
+                f"(max global_buck={buck_g:.3f} < threshold={buckling_util_threshold:.3f})"
+            )
+
+
+def _get_jacket_member_arrays(wt_opt, name: str, units=None) -> np.ndarray | None:
+    """Read a per-element jacket array from fixedse (or post alias)."""
+    for prefix in ("fixedse.", "fixedse.post."):
+        try:
+            if units is None:
+                return np.asarray(wt_opt.get_val(prefix + name), dtype=float)
+            return np.asarray(wt_opt.get_val(prefix + name, units=units), dtype=float)
+        except Exception:
+            continue
+    return None
+
+
+def print_jacket_member_buckling_diagnostics(
+    wt_opt,
+    modeling_options: dict,
+    label: str = "",
+    util_threshold: float = 1.0,
+    top_n: int = 5,
+) -> None:
+    """
+    Report which jacket members drive global / shell / stress utilization.
+
+    Uses DNVGL-RP-C202 checks in ``JacketPost`` (k=1.0 legs, k=0.8 braces per
+    element; shell buckling on unstiffened cylinder segments).
+    """
+    from wisdem.fixed_bottomse.jacket import (
+        JACKET_GLOBAL_BUCKLING_K_BRACE,
+        JACKET_GLOBAL_BUCKLING_K_LEG,
+        jacket_element_metadata,
+        jacket_global_buckling_k_factors,
+    )
+
+    fb = modeling_options.get("WISDEM", {}).get("FixedBottomSE", {})
+    n_legs = int(fb.get("n_legs", 4))
+    n_bays = int(fb.get("n_bays", 3))
+    mud_brace = bool(fb.get("mud_brace", True))
+    n_dlc = int(modeling_options.get("WISDEM", {}).get("n_dlc", 1))
+
+    meta = jacket_element_metadata(n_legs, n_bays, mud_brace)
+    k_factors = jacket_global_buckling_k_factors(n_legs, n_bays, mud_brace)
+    n_elem = len(meta)
+
+    buck_g = _get_jacket_member_arrays(wt_opt, "constr_global_buckling")
+    buck_s = _get_jacket_member_arrays(wt_opt, "constr_shell_buckling")
+    stress = _get_jacket_member_arrays(wt_opt, "constr_stress")
+    elem_L = _get_jacket_member_arrays(wt_opt, "jacket_elem_L", units="m")
+    elem_D = _get_jacket_member_arrays(wt_opt, "jacket_elem_D", units="m")
+    elem_t = _get_jacket_member_arrays(wt_opt, "jacket_elem_t", units="m")
+    fz = _get_jacket_member_arrays(wt_opt, "jacket_Fz", units="N")
+    mxx = _get_jacket_member_arrays(wt_opt, "jacket_Mxx", units="N*m")
+    myy = _get_jacket_member_arrays(wt_opt, "jacket_Myy", units="N*m")
+
+    if buck_g is None:
+        print(f"  [{label}] member diagnostics: constr_global_buckling not available")
+        return
+
+    buck_g = np.atleast_2d(buck_g)
+    if buck_g.shape[0] == n_dlc and buck_g.shape[1] == n_elem:
+        buck_g = buck_g.T
+    if buck_g.shape[0] > n_elem:
+        buck_g = buck_g[:n_elem]
+    if buck_g.shape[1] > n_dlc:
+        buck_g = buck_g[:, :n_dlc]
+
+    dlc_names = [
+        "DLC1_rated_GustETM",
+        "DLC2_parked_extreme_V50",
+    ]
+    while len(dlc_names) < n_dlc:
+        dlc_names.append(f"DLC{len(dlc_names) + 1}")
+
+    def _align_member_2d(arr):
+        if arr is None:
+            return None
+        arr = np.atleast_2d(np.asarray(arr, dtype=float))
+        if arr.shape[0] == n_dlc and arr.shape[1] == n_elem:
+            arr = arr.T
+        if arr.shape[0] > n_elem:
+            arr = arr[:n_elem]
+        if arr.shape[1] > n_dlc:
+            arr = arr[:, :n_dlc]
+        return arr
+
+    buck_s = _align_member_2d(buck_s)
+    stress = _align_member_2d(stress)
+    fz = _align_member_2d(fz)
+    mxx = _align_member_2d(mxx)
+    myy = _align_member_2d(myy)
+    # Ghost members are the last n_legs elements; structural checks omit them.
+    if elem_L is not None:
+        elem_L = np.atleast_1d(elem_L).flatten()[:n_elem]
+    if elem_D is not None:
+        elem_D = np.atleast_1d(elem_D).flatten()[:n_elem]
+    if elem_t is not None:
+        elem_t = np.atleast_1d(elem_t).flatten()[:n_elem]
+
+    # Rank (element, DLC) pairs by global buckling utilization
+    pairs = []
+    for i in range(min(n_elem, buck_g.shape[0])):
+        for k in range(min(n_dlc, buck_g.shape[1])):
+            util_g = float(buck_g[i, k])
+            if np.isfinite(util_g) and util_g >= util_threshold:
+                util_s = float(buck_s[i, k]) if buck_s is not None else float("nan")
+                util_st = float(stress[i, k]) if stress is not None else float("nan")
+                pairs.append((util_g, i, k, util_s, util_st))
+    pairs.sort(reverse=True)
+
+    tag = f"[{label}] " if label else ""
+    print(f"\n  {tag}=== Jacket member buckling diagnostics (global util >= {util_threshold:.2f}) ===")
+    print(
+        f"  {tag}Check model: DNVGL-RP-C202 via JacketPost — "
+        "global = column buckling + axial/bending interaction; "
+        "shell = local cylinder shell buckling (separate constraint)."
+    )
+    print(
+        f"  {tag}Boundary/end conditions (global): k={JACKET_GLOBAL_BUCKLING_K_LEG:.1f} legs, "
+        f"k={JACKET_GLOBAL_BUCKLING_K_BRACE:.1f} braces (Leff = k·L_element per Frame3DD member)."
+    )
+
+    if not pairs:
+        max_g = float(np.nanmax(buck_g)) if buck_g.size else float("nan")
+        print(f"  {tag}No member/DLC pairs above threshold (peak global util={max_g:.3f}).")
+        return
+
+    show = pairs[:top_n]
+    print(f"  {tag}Top {len(show)} critical member(s) by global buckling utilization:\n")
+    for rank, (util_g, i, k, util_s, util_st) in enumerate(show, start=1):
+        m = meta[i]
+        L = float(elem_L[i]) if elem_L is not None else float("nan")
+        D = float(elem_D[i]) if elem_D is not None else float("nan")
+        t = float(elem_t[i]) if elem_t is not None else float("nan")
+        axial = float(fz[i, k]) if fz is not None else float("nan")
+        if mxx is not None and myy is not None:
+            moment = float(np.hypot(mxx[i, k], myy[i, k]))
+        else:
+            moment = float("nan")
+
+        compression = axial < 0.0 if np.isfinite(axial) else None
+        k_factor = float(k_factors[i])
+        leff = k_factor * L if np.isfinite(L) else float("nan")
+        slenderness_ld = L / D if np.isfinite(L) and np.isfinite(D) and D > 0 else float("nan")
+
+        if np.isfinite(util_g) and np.isfinite(util_s) and np.isfinite(util_st):
+            if util_g >= util_s and util_g >= util_st:
+                governing = "global column buckling (+ axial/bending interaction)"
+            elif util_s >= util_g and util_s >= util_st:
+                governing = "local shell buckling"
+            else:
+                governing = "von Mises stress"
+        else:
+            governing = "global buckling (reported constraint)"
+
+        dlc_label = dlc_names[k] if k < len(dlc_names) else f"DLC{k + 1}"
+        extreme_note = (
+            "parked extreme (V50 thrust + RNA weight)"
+            if "parked" in dlc_label or k == 1
+            else "rated operational (GustETM RNA + rated wind)"
+        )
+
+        print(f"  {tag}#{rank}  {m['label']}  (elem {i}, {dlc_label})")
+        print(f"  {tag}    Member type: {m['member_type']}")
+        print(
+            f"  {tag}    Compression-dominated: "
+            f"{'yes' if compression else 'no' if compression is not None else 'unknown'} "
+            f"(Fz={axial/1e3:.1f} kN)"
+        )
+        print(
+            f"  {tag}    Geometry: L={L:.3f} m, D={D:.3f} m, t={t*1e3:.1f} mm, "
+            f"L/D={slenderness_ld:.1f}"
+        )
+        print(
+            f"  {tag}    Effective buckling length: Leff=k·L={leff:.3f} m "
+            f"(k={k_factor:.1f}, {m['member_type']})"
+        )
+        print(
+            f"  {tag}    Loads: |Fz|={abs(axial)/1e3:.1f} kN axial, "
+            f"|M|={moment/1e3:.1f} kN·m bending"
+        )
+        print(
+            f"  {tag}    Utilization: global={util_g:.3f}  shell={util_s:.3f}  "
+            f"stress={util_st:.3f}  → governing: {governing}"
+        )
+        print(f"  {tag}    Load case: {dlc_label} ({extreme_note})")
+        if slenderness_ld > 40:
+            print(f"  {tag}    Note: L/D={slenderness_ld:.1f} is slender for a tubular brace/leg.")
+        print("")
 
 
 def repair_feasible_jacket_start(
@@ -1524,16 +1837,28 @@ def repair_feasible_jacket_start(
         geom_path = os.path.join(TMP_DIR, f"geometry_{tag}_preflight_{i}.yaml")
         dump_yaml(wt, geom_path)
         wt_opt, _, _ = run_wisdem(geom_path, modeling_out, analysis_path, run_only=True)
+        strength_util = max_jacket_strength_util(wt_opt)
+        global_buck = max_jacket_global_buckling_util(wt_opt)
         util = max_strength_utilization(wt_opt)
         f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
         print(
             f"  [preflight {i}] r_head={r_head:.3f} ratio={ratio:.3f} "
             f"leg_D={leg_d:.3f} leg_t={leg_t*1e3:.1f} mm  "
-            f"util={util:.3f}  f1={f1:.4f} Hz"
+            f"util={util:.3f} (stress/shell={strength_util:.3f}, global_buck={global_buck:.3f})  "
+            f"f1={f1:.4f} Hz"
         )
-        if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
+        if jacket_preflight_is_ready(wt_opt, f_lo, f_hi, check_frequency=freq_on):
             print("  Preflight: start is feasible enough for SLSQP")
             return wt
+
+        global_buck_diag = max_jacket_global_buckling_util(wt_opt)
+        if np.isfinite(global_buck_diag) and global_buck_diag >= _PREFLIGHT_GLOBAL_BUCK_TARGET:
+            print_jacket_member_buckling_diagnostics(
+                wt_opt,
+                modeling,
+                label=f"preflight {i}",
+                util_threshold=1.0,
+            )
 
         r_new, ratio_new = r_head, ratio
         leg_d_new, leg_t_new = leg_d, leg_t
@@ -1546,8 +1871,8 @@ def repair_feasible_jacket_start(
             flare_tgt = 0.5 * (_J_FLARE_LO + _J_FLARE_HI)
             ratio_new = _clip(1.0 + flare_tgt * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI)
 
-        if np.isfinite(util) and util > 1.0:
-            scale = min(1.5, float(util) * 1.05)
+        scale = _jacket_preflight_scale(strength_util, global_buck)
+        if scale > 1.0:
             leg_d_new = _clip(leg_d * scale, _J_LEG_D_LO, _J_LEG_D_HI)
             leg_t_new = _clamp_tube_wall(
                 leg_d_new, _clip(leg_t * scale, _J_LEG_T_LO, _J_LEG_T_HI)
@@ -1556,6 +1881,8 @@ def repair_feasible_jacket_start(
             brace_t_new = _clamp_tube_wall(
                 brace_d_new, _clip(brace_t0 * scale, _J_BRACE_T_LO, _J_BRACE_T_HI)
             )
+            if scale > 1.5 and np.isfinite(global_buck) and global_buck > 1.0:
+                print(f"  [preflight {i}] aggressive scale={scale:.3f} for global_buck={global_buck:.3f}")
 
         if freq_on and np.isfinite(f1) and f1 < f_lo:
             # Too soft: widen base and fatten members (keep within flare band)
@@ -1578,7 +1905,7 @@ def repair_feasible_jacket_start(
                     1.0 + _J_FLARE_LO * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI
                 )
             r_new = _clip(max(d_tow, r_head - 0.25), _J_RHEAD_LO, _J_RHEAD_HI)
-            if not (np.isfinite(util) and util > 1.0):
+            if not (scale > 1.0):
                 leg_d_new = _clip(leg_d * 0.95, _J_LEG_D_LO, _J_LEG_D_HI)
                 brace_d_new = _clip(brace_d0 * 0.95, _J_BRACE_D_LO, _J_BRACE_D_HI)
 
@@ -1614,6 +1941,8 @@ def run_jacket_two_stage(
     tag: str,
     f_lo: float,
     f_hi: float,
+    member_diagnostics: bool = False,
+    buckling_util_threshold: float = 1.0,
 ) -> tuple:
     """
     Preflight feasible seed -> Stage 1 (shorter) -> Stage 2 polish.
@@ -1633,10 +1962,19 @@ def run_jacket_two_stage(
     dump_yaml(analysis_s1, analysis_s1_path)
     dump_yaml(wt_geom, wt_s1_path)
 
-    print("  Stage 1 (full constraints, shorter budget) …")
+    print("  Stage 1 (stress/shell/flare; global buckling off, shorter budget) …")
     wt_opt, modeling_options, _opt = run_wisdem(wt_s1_path, modeling_out, analysis_s1_path)
     exit1 = get_opt_exit_mode(wt_opt)
-    print_jacket_diagnostics(wt_opt, "stage1", f_lo, f_hi, exit_mode=exit1)
+    print_jacket_diagnostics(
+        wt_opt,
+        "stage1",
+        f_lo,
+        f_hi,
+        exit_mode=exit1,
+        modeling_options=modeling_options,
+        member_diagnostics=member_diagnostics,
+        buckling_util_threshold=buckling_util_threshold,
+    )
 
     r_head, ratio, leg_d, leg_t, brace_d, brace_t = extract_jacket_dvs(wt_opt)
     wt_after_s1 = seed_jacket_geometry(
@@ -1652,10 +1990,25 @@ def run_jacket_two_stage(
     dump_yaml(analysis_s2, analysis_s2_path)
     dump_yaml(wt_after_s1, wt_s2_path)
 
-    print("  Stage 2 (full constraints, polish) …")
+    global_on = bool(
+        analysis.get("constraints", {}).get("jacket", {}).get("global_buckling", {}).get("flag", False)
+    )
+    if global_on:
+        print("  Stage 2 (full constraints incl. global buckling, polish) …")
+    else:
+        print("  Stage 2 (full constraints, polish) …")
     wt_opt, modeling_options, _opt = run_wisdem(wt_s2_path, modeling_out, analysis_s2_path)
     exit2 = get_opt_exit_mode(wt_opt)
-    print_jacket_diagnostics(wt_opt, "stage2", f_lo, f_hi, exit_mode=exit2)
+    print_jacket_diagnostics(
+        wt_opt,
+        "stage2",
+        f_lo,
+        f_hi,
+        exit_mode=exit2,
+        modeling_options=modeling_options,
+        member_diagnostics=member_diagnostics,
+        buckling_util_threshold=buckling_util_threshold,
+    )
 
     dvs = extract_jacket_dvs(wt_opt)
     return wt_opt, modeling_options, exit2, dvs
@@ -1796,9 +2149,19 @@ def run_batch(
     foundation_mode: str = "both",
     jacket_legs_mode: str = "both",
     stop_on_error: bool = False,
+    row_filter: int | None = None,
+    member_diagnostics: bool = False,
+    buckling_util_threshold: float = 1.0,
 ) -> int:
     run_wisdem, append_foundation_results, cdr = _setup_wisdem()
     scenarios = read_scenarios(csv_path)
+    if row_filter is not None:
+        scenarios = [s for s in scenarios if s.get("_csv_row_number") == row_filter]
+        if not scenarios:
+            raise ValueError(
+                f"No scenario row with CSV line number {row_filter} in {csv_path}. "
+                "Row numbers match the spreadsheet line (header is row 1; first data row is 2)."
+            )
     turbines = load_turbine_lookup(turbine_csv)
     foundations = resolve_foundations(foundation_mode)
     os.makedirs(TMP_DIR, exist_ok=True)
@@ -1812,6 +2175,12 @@ def run_batch(
     n_ok = 0
     n_fail = 0
     print(f"Loaded {len(scenarios)} scenario row(s) from {csv_path}")
+    if row_filter is not None:
+        print(f"  (--row {row_filter}: running that CSV line only)")
+    if member_diagnostics and "jacket" in foundations:
+        print(
+            f"  Member buckling diagnostics enabled when global util >= {buckling_util_threshold:.2f}"
+        )
     print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
     if "jacket" in foundations:
@@ -1960,7 +2329,16 @@ def run_batch(
                         out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
                     else:
                         wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
-                            run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
+                            run_wisdem,
+                            wt_geom,
+                            modeling,
+                            analysis,
+                            modeling_out,
+                            tag,
+                            f_lo,
+                            f_hi,
+                            member_diagnostics=member_diagnostics,
+                            buckling_util_threshold=buckling_util_threshold,
                         )
                         freq_on = bool(
                             analysis.get("constraints", {})
@@ -2048,6 +2426,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Stop at the first failed scenario instead of continuing.",
     )
+    parser.add_argument(
+        "--row",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Run only the scenario on CSV line N (header is line 1; first data row is 2). "
+            "Useful for debugging a single case from scenarios_template.csv."
+        ),
+    )
+    parser.add_argument(
+        "--member-diagnostics",
+        action="store_true",
+        help=(
+            "For jacket runs, print per-member buckling details when global utilization "
+            "exceeds --buckling-util-threshold (also prints during preflight when util >= 2)."
+        ),
+    )
+    parser.add_argument(
+        "--buckling-util-threshold",
+        type=float,
+        default=1.0,
+        help="Global buckling utilization threshold for --member-diagnostics (default: 1.0).",
+    )
     args = parser.parse_args(argv)
     return run_batch(
         args.input_csv,
@@ -2055,6 +2457,9 @@ def main(argv: list[str] | None = None) -> int:
         foundation_mode=args.foundation,
         jacket_legs_mode=args.jacket_legs,
         stop_on_error=args.stop_on_error,
+        row_filter=args.row,
+        member_diagnostics=args.member_diagnostics,
+        buckling_util_threshold=args.buckling_util_threshold,
     )
 
 
