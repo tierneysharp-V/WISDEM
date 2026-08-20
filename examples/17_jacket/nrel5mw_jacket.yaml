@@ -40,6 +40,7 @@ components:
                 values: [10.0, 43.8, 87.6]
     jacket:
         material: steel
+        outfitting_factor: 1.1
         transition_piece_mass: 100000.0
         transition_piece_cost: 100000.0
         n_bays: 4

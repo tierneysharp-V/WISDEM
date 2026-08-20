@@ -15,22 +15,30 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+# Old result-CSV names that map onto the current schema when rewriting a file.
+COLUMN_ALIASES = {
+    "jacket_footprint_m": "jacket_foot_radius_m",
+    "pile_length_m": "monopile_height_m",
+    "pile_diameter_m": "monopile_diameter_m",
+    "pile_thickness_m": "monopile_thickness_m",
+}
+
 MONOPILE_CSV_COLUMNS = [
     "timestamp",
+    "turbine_rating_W",
     "tower_base_shear_N",
     "tower_base_vertical_N",
     "tower_base_overturning_moment_Nm",
-    "turbine_rating_W",
+    "rna_mass_kg",
     "V50_mps",
-    "water_depth_m",
     "Hs50_m",
+    "water_depth_m",
     "soil_shear_modulus_Pa",
-    "pile_length_m",
-    "pile_diameter_m",
-    "pile_thickness_m",
-    "scour_protection_volume_m3",
-    "transition_piece_mass_kg",
+    "monopile_height_m",
+    "monopile_diameter_m",
+    "monopile_thickness_m",
     "monopile_mass_kg",
+    "transition_piece_mass_kg",
     "total_foundation_mass_kg",
     "opt_exit_mode",
     "f1_Hz",
@@ -38,24 +46,22 @@ MONOPILE_CSV_COLUMNS = [
 
 JACKET_CSV_COLUMNS = [
     "timestamp",
+    "turbine_rating_W",
     "tower_base_shear_N",
     "tower_base_vertical_N",
     "tower_base_overturning_moment_Nm",
-    "turbine_rating_W",
+    "rna_mass_kg",
     "V50_mps",
-    "water_depth_m",
     "Hs50_m",
-    "soil_shear_modulus_Pa",
+    "water_depth_m",
     "jacket_height_m",
-    "jacket_footprint_m",
+    "jacket_foot_radius_m",
     "leg_diameter_m",
     "leg_thickness_m",
     "jacket_mass_kg",
-    "scour_protection_volume_m3",
     "transition_piece_mass_kg",
     "total_foundation_mass_kg",
     "opt_exit_mode",
-    "f1_Hz",
 ]
 
 _EXAMPLES_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -132,6 +138,22 @@ def csv_path_for_foundation_type(ftype, modeling_options=None):
     raise ValueError(f"Unknown foundation type '{ftype}'; expected jacket or monopile")
 
 
+def _remap_existing_row(erow, columns):
+    """Map an on-disk row onto the current schema (aliases + current names)."""
+    out = {}
+    for col in columns:
+        if col in erow and erow[col] not in (None, ""):
+            out[col] = erow[col]
+            continue
+        for old, new in COLUMN_ALIASES.items():
+            if new == col and old in erow and erow[old] not in (None, ""):
+                out[col] = erow[old]
+                break
+        else:
+            out[col] = erow.get(col, "")
+    return out
+
+
 def collect_foundation_row(wt_opt, modeling_options, extras=None):
     """Build one results dict matching the type-specific CSV columns."""
     ftype = _detect_foundation_type(modeling_options)
@@ -139,14 +161,12 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
     row = {col: np.nan for col in columns}
     row["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    bos_on = modeling_options.get("flags", {}).get("bos", False)
-
     if ftype == "jacket":
         jacket_mass = _get_val(wt_opt, "fixedse.jacket_mass", units="kg")
         tp_mass = _get_val(wt_opt, "jacket.transition_piece_mass", units="kg")
         row["jacket_mass_kg"] = jacket_mass
         row["jacket_height_m"] = _get_val(wt_opt, "jacket.height", units="m")
-        row["jacket_footprint_m"] = _get_val(wt_opt, "fixedse.r_foot", units="m")
+        row["jacket_foot_radius_m"] = _get_val(wt_opt, "fixedse.r_foot", units="m")
         row["leg_diameter_m"] = _get_val(wt_opt, "jacket.leg_diameter", units="m")
         row["leg_thickness_m"] = _get_val(wt_opt, "jacket.leg_thickness", units="m")
         row["transition_piece_mass_kg"] = tp_mass
@@ -169,19 +189,13 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
         elif np.isfinite(mono_mass):
             row["monopile_mass_kg"] = mono_mass
             row["total_foundation_mass_kg"] = mono_mass
-        row["pile_diameter_m"] = _get_val(wt_opt, "monopile.diameter", units="m", reduce="max")
-        row["pile_length_m"] = _get_val(wt_opt, "monopile.height", units="m")
+        row["monopile_diameter_m"] = _get_val(wt_opt, "monopile.diameter", units="m", reduce="max")
+        row["monopile_height_m"] = _get_val(wt_opt, "monopile.height", units="m")
         wall = _get_val(wt_opt, "fixedse.monopile_wall_thickness", units="m", reduce="max")
         if not np.isfinite(wall):
             wall = _get_val(wt_opt, "monopile.layer_thickness", units="m", reduce="max")
-        row["pile_thickness_m"] = wall
+        row["monopile_thickness_m"] = wall
 
-    if bos_on:
-        row["scour_protection_volume_m3"] = _get_val(
-            wt_opt, "orbit.scour_protection_volume", units="m**3"
-        )
-
-    # Modal frequency (useful for both foundations when frequency constrains design)
     if "f1_Hz" in columns:
         row["f1_Hz"] = _get_val(wt_opt, "fixedse.structural_frequencies")
 
@@ -201,7 +215,7 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=No
     results_jacket_3.csv (three-legged jackets), or results_monopile.csv
     based on modeling flags and n_legs.
 
-    extras : optional dict of extra column values (e.g. loads, site params).
+    extras : optional dict of extra column values (e.g. loads, site params, RNA mass).
 
     Returns
     -------
@@ -228,7 +242,7 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=No
                 writer = csv.DictWriter(wf, fieldnames=columns, extrasaction="ignore")
                 writer.writeheader()
                 for erow in existing_rows:
-                    writer.writerow({c: erow.get(c, "") for c in columns})
+                    writer.writerow(_remap_existing_row(erow, columns))
             write_header = False
         else:
             write_header = False

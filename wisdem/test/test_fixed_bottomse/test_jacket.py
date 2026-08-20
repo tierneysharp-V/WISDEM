@@ -209,5 +209,63 @@ class Test(unittest.TestCase):
         prob.run_model()
 
 
+class TestJacketTubeDToT(unittest.TestCase):
+    def test_d_to_t_output(self):
+        from wisdem.fixed_bottomse.jacket import JacketTubeDToT
+
+        modeling_options = {
+            "WISDEM": {"FixedBottomSE": {"n_bays": 2}},
+        }
+        prob = om.Problem(reports=False)
+        prob.model.add_subsystem("d2t", JacketTubeDToT(modeling_options=modeling_options))
+        prob.setup()
+        prob.set_val("d2t.leg_diameter", 2.4, units="m")
+        prob.set_val("d2t.leg_thickness", 0.02, units="m")
+        prob.set_val("d2t.brace_diameters", np.array([1.0, 0.8]), units="m")
+        prob.set_val("d2t.brace_thicknesses", np.array([0.02, 0.025]), units="m")
+        prob.run_model()
+        d2t = prob.get_val("d2t.constr_d_to_t")
+        self.assertAlmostEqual(d2t[0], 120.0)
+        self.assertAlmostEqual(d2t[1], 50.0)
+        self.assertAlmostEqual(d2t[2], 32.0)
+
+    def test_jacket_outfitting_factor(self):
+        modeling_options = {}
+        modeling_options["WISDEM"] = {}
+        modeling_options["WISDEM"]["n_dlc"] = 1
+        modeling_options["WISDEM"]["FixedBottomSE"] = {}
+        modeling_options["WISDEM"]["FixedBottomSE"]["mud_brace"] = True
+        modeling_options["WISDEM"]["FixedBottomSE"]["n_legs"] = 3
+        modeling_options["WISDEM"]["FixedBottomSE"]["n_bays"] = 2
+        modeling_options["WISDEM"]["FixedBottomSE"]["gamma_f"] = 1.0
+        modeling_options["WISDEM"]["FixedBottomSE"]["gamma_m"] = 1.0
+        modeling_options["WISDEM"]["FixedBottomSE"]["gamma_n"] = 1.0
+        modeling_options["WISDEM"]["FixedBottomSE"]["gamma_b"] = 1.0
+        modeling_options["WISDEM"]["FixedBottomSE"]["material"] = "steel"
+        modeling_options["WISDEM"]["FixedBottomSE"]["frame3dd"] = {}
+        modeling_options["WISDEM"]["FixedBottomSE"]["frame3dd"]["shear"] = 1
+        modeling_options["WISDEM"]["FixedBottomSE"]["frame3dd"]["geom"] = 1
+        modeling_options["WISDEM"]["FixedBottomSE"]["save_truss_figures"] = False
+        modeling_options["materials"] = {}
+        modeling_options["materials"]["n_mat"] = 1
+
+        def _run(f_outfit):
+            prob = om.Problem(reports=False, model=JacketSE(modeling_options=modeling_options))
+            prob.setup()
+            prob["material_names"] = ["steel"]
+            prob["E_mat"] = 1e10 * np.ones((1, 3))
+            prob["G_mat"] = 1e8 * np.ones((1, 3))
+            prob["rho_mat"] = 1e4
+            prob["sigma_y_mat"] = 1e8
+            prob["outfitting_factor_in"] = f_outfit
+            prob.run_model()
+            return float(prob["jacket_mass"][0])
+
+        m1 = _run(1.0)
+        m11 = _run(1.1)
+        self.assertGreater(m1, 0.0)
+        self.assertAlmostEqual(m11 / m1, 1.1, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

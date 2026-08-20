@@ -686,6 +686,39 @@ class ComputeJacketNodes(om.ExplicitComponent):
             outputs["constr_jacket_flare"] = 0.0
 
 
+class JacketTubeDToT(om.ExplicitComponent):
+    """
+    Diameter-to-thickness ratios for jacket legs and braces.
+
+    Outputs one D/t value per leg (scalar) and per brace bay. Constrain with
+    ``upper=100`` so ``t >= D/100`` (i.e. D/t <= 100).
+    """
+
+    def initialize(self):
+        self.options.declare("modeling_options")
+
+    def setup(self):
+        n_bays = self.options["modeling_options"]["WISDEM"]["FixedBottomSE"]["n_bays"]
+        self.add_input("leg_diameter", val=1.4, units="m")
+        self.add_input("leg_thickness", val=0.1, units="m")
+        self.add_input("brace_diameters", val=np.ones(n_bays), units="m")
+        self.add_input("brace_thicknesses", val=np.ones(n_bays) * 0.1, units="m")
+        self.add_output("constr_d_to_t", val=np.zeros(1 + n_bays))
+
+    def compute(self, inputs, outputs):
+        leg_d = float(np.asarray(inputs["leg_diameter"]).flatten()[0])
+        leg_t = float(np.asarray(inputs["leg_thickness"]).flatten()[0])
+        brace_d = np.asarray(inputs["brace_diameters"], dtype=float).flatten()
+        brace_t = np.asarray(inputs["brace_thicknesses"], dtype=float).flatten()
+        n_bays = brace_d.size
+        if brace_t.size != n_bays:
+            brace_t = np.resize(brace_t, n_bays)
+
+        leg_dt = leg_d / max(leg_t, 1e-12)
+        brace_dt = brace_d / np.maximum(brace_t, 1e-12)
+        outputs["constr_d_to_t"] = np.r_[leg_dt, brace_dt]
+
+
 class JacketHeightAirgapConstraint(om.ExplicitComponent):
     """
     Clearance metric for jacket height vs site water depth and waves.
@@ -759,6 +792,11 @@ class ComputeFrame3DD(om.ExplicitComponent):
         self.add_input("gravity_foundation_I", np.zeros(6), units="kg*m**2")
         self.add_input("tower_mass", val=0.0, units="kg")
         self.add_input("jacket_mass_user", val=0.0, units="kg")
+        self.add_input(
+            "outfitting_factor_in",
+            val=1.1,
+            desc="Multiplier on jacket steel mass for secondary structure / outfitting",
+        )
 
         # For modal analysis only (loads captured in turbine_F & turbine_M)
         self.add_input("turbine_mass", val=0.0, units="kg")
@@ -990,6 +1028,14 @@ class ComputeFrame3DD(om.ExplicitComponent):
         G[-n_legs:] *= 1.0e8
         rho[-n_legs:] = 1.0e-2
 
+        # Outfitting scales jacket mass (and Frame3DD linear density) but not stiffness.
+        f_outfit = float(inputs["outfitting_factor_in"][0])
+        m_jack_user = float(inputs["jacket_mass_user"][0])
+        m_jack = f_outfit * np.sum(Area[:-n_legs] * rho[:-n_legs] * L[:-n_legs])
+        outputs["jacket_mass"] = m_jack_user if m_jack_user > 0.0 else m_jack
+        outputs["structural_mass"] = outputs["jacket_mass"] + inputs["tower_mass"]
+        rho[:-n_legs] *= f_outfit
+
         outputs["jacket_elem_N"] = connect_mat = np.c_[N1, N2] - 1  # Storing as 0-indexed
         outputs["jacket_elem_L"] = L
         outputs["jacket_elem_D"] = D
@@ -1018,13 +1064,6 @@ class ComputeFrame3DD(om.ExplicitComponent):
         roll = np.zeros(self.num_elements)
 
         elements = pyframe3dd.ElementData(element, N1, N2, Area, Asx, Asy, J0, Ixx, Iyy, E, G, roll, rho)
-
-        # Populate mass and cost outputs
-        # TODO: Is there an "outfitting" factor for jackets.  Seems like it would be much smaller than monopiles
-        m_jack_user = float(inputs["jacket_mass_user"][0])
-        m_jack = np.sum(Area[:-n_legs] * rho[:-n_legs] * L[:-n_legs])
-        outputs["jacket_mass"] = m_jack_user if m_jack_user > 0.0 else m_jack
-        outputs["structural_mass"] = outputs["jacket_mass"] + inputs["tower_mass"]
 
         # ------ options ------------
         dx = -1.0
@@ -1394,6 +1433,7 @@ class JacketSEProp(om.Group):
 
         self.add_subsystem("pre", PreDiscretization(), promotes=["*"])
         self.add_subsystem("nodes", ComputeJacketNodes(modeling_options=modeling_options), promotes=["*"])
+        self.add_subsystem("tube_d_to_t", JacketTubeDToT(modeling_options=modeling_options), promotes=["*"])
         self.add_subsystem("height_airgap", JacketHeightAirgapConstraint(), promotes=["*"])
 
 

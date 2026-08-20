@@ -17,6 +17,7 @@ Turbine lookup CSV:
   First column = parameter (YAML path or special key). Remaining columns = turbines.
   Special row `_source_yaml` may point at a full geometry YAML; other rows override.
   Rating lookup uses `assembly.rated_power` (or `turbine_rating_W`).
+  `rna_mass_kg` is lookup-only (results CSV); it is not written into geometry YAML.
 
 Workflow per scenario:
   1. Look up turbine by rating and build a temporary full geometry YAML
@@ -92,6 +93,8 @@ _WARMSTART_MAX_UTIL = 1.05
 _PREFLIGHT_GLOBAL_BUCK_TARGET = 2.0  # preflight tries to reduce global buckling util below this
 _RATING_MATCH_RTOL = 1e-6
 _RATING_MATCH_ATOL = 1.0  # Watts
+# Lookup-CSV keys that must not be written into geometry YAML (schema / results-only).
+_LOOKUP_ONLY_KEYS = frozenset({"rna_mass_kg", "rna_mass", "turbine_rating_W"})
 
 # Early-design parked rotor: feathered blades as a low-Cd disk (not IEC DLC 6.x)
 PARKED_ROTOR_CD = 0.04
@@ -400,7 +403,7 @@ def build_turbine_geometry(
         wt = load_yaml(src_path)
 
     for key, value in turbine_params.items():
-        if key.startswith("_"):
+        if key.startswith("_") or key in _LOOKUP_ONLY_KEYS:
             continue
         _set_by_path(wt, key, value)
 
@@ -478,6 +481,15 @@ def lookup_turbine_column(
         names = ", ".join(m[0] for m in matches)
         raise ValueError(f"Multiple turbines match rating {rating_w}: {names}")
     return matches[0]
+
+
+def lookup_rna_mass(params: dict[str, Any]) -> float:
+    """RNA mass [kg] from the turbine lookup row (``rna_mass_kg`` or ``rna_mass``)."""
+    for key in ("rna_mass_kg", "rna_mass"):
+        val = params.get(key)
+        if val is not None and not _is_blank(val):
+            return _to_float(val)
+    return float("nan")
 
 
 def _rotor_speed_limits_rpm(wt_geom: dict) -> tuple[float, float, float, str]:
@@ -859,14 +871,18 @@ def _clip(v: float, lo: float, hi: float) -> float:
     return float(min(hi, max(lo, v)))
 
 
-def _clamp_tube_wall(diameter: float, thickness: float) -> float:
-    """Keep tubular wall thickness below D/2 so Frame3DD Area stays > 0."""
+def _clamp_tube_wall(diameter: float, thickness: float, t_lo: float | None = None) -> float:
+    """Keep tubular wall thickness within [t_min, 0.45·D] so Frame3DD Area stays > 0."""
     d = float(diameter)
     t = float(thickness)
+    floor = float(_J_LEG_T_LO if t_lo is None else t_lo)
     if not np.isfinite(d) or d <= 0.0:
-        return _J_LEG_T_LO
+        return floor
+    t_min = floor
+    if _J_ENFORCE_D_TO_T:
+        t_min = max(t_min, d / _J_D_TO_T_MAX)
     t_max = _J_T_OVER_D_MAX * d
-    return _clip(t, min(_J_LEG_T_LO, t_max), t_max)
+    return _clip(t, min(t_min, t_max), t_max)
 
 
 def seed_jacket_geometry(
@@ -885,7 +901,7 @@ def seed_jacket_geometry(
     jacket["r_head"] = float(r_head)
     jacket["r_foot"] = float(r_head) * float(foot_head_ratio)
     leg_d = _clip(float(leg_diameter), _J_LEG_D_LO, _J_LEG_D_HI)
-    leg_t = _clamp_tube_wall(leg_d, _clip(float(leg_thickness), _J_LEG_T_LO, _J_LEG_T_HI))
+    leg_t = _clamp_tube_wall(leg_d, _clip(float(leg_thickness), _J_LEG_T_LO, _J_LEG_T_HI), t_lo=_J_LEG_T_LO)
     jacket["leg_diameter"] = leg_d
     jacket["leg_thickness"] = leg_t
 
@@ -911,7 +927,7 @@ def seed_jacket_geometry(
     if len(raw_t) != len(brace_d):
         raw_t = (raw_t + [raw_t[-1]] * len(brace_d))[: len(brace_d)]
     brace_t = [
-        _clamp_tube_wall(d, _clip(t, _J_BRACE_T_LO, _J_BRACE_T_HI))
+        _clamp_tube_wall(d, _clip(t, _J_BRACE_T_LO, _J_BRACE_T_HI), t_lo=_J_BRACE_T_LO)
         for d, t in zip(brace_d, raw_t)
     ]
     jacket["brace_diameters"] = brace_d
@@ -1178,18 +1194,32 @@ def analysis_stage2_full(analysis: dict) -> dict:
     return opts
 
 
+def jacket_frequency_enabled(analysis: dict) -> bool:
+    """True when jacket soft-stiff frequency is requested in the base analysis YAML."""
+    return bool(
+        analysis.get("constraints", {}).get("jacket", {}).get("frequency_1", {}).get("flag", False)
+    )
+
+
 def analysis_jacket_stage1(analysis: dict) -> dict:
-    """Stage 1 jacket: stress/shell/flare (global buckling off), shorter iteration budget."""
+    """Stage 1 jacket: stress/shell/flare (global buckling and frequency off), shorter budget."""
     opts = copy.deepcopy(analysis)
     opts.setdefault("driver", {}).setdefault("optimization", {})["max_iter"] = STAGE1_MAX_ITER
     jacket_constr = opts.setdefault("constraints", {}).setdefault("jacket", {})
     jacket_constr.setdefault("global_buckling", {})["flag"] = False
+    jacket_constr.setdefault("frequency_1", {})["flag"] = False
     return opts
 
 
 def analysis_jacket_stage2(analysis: dict) -> dict:
-    """Stage 2 jacket: full YAML constraints including global buckling."""
-    return copy.deepcopy(analysis)
+    """Stage 2 jacket: full YAML constraints including global buckling and frequency."""
+    opts = copy.deepcopy(analysis)
+    if jacket_frequency_enabled(analysis):
+        opt_drv = opts.setdefault("driver", {}).setdefault("optimization", {})
+        # Stabler finite-difference gradients for the modal frequency constraint
+        opt_drv["step_size"] = max(float(opt_drv.get("step_size", 1e-6)), 1e-5)
+        opt_drv["form"] = "central"
+    return opts
 
 
 def get_opt_exit_mode(wt_opt) -> Any:
@@ -1417,10 +1447,12 @@ _T_HI = 2e-1
 _J_RHEAD_LO, _J_RHEAD_HI = 2.0, 20.0
 _J_RATIO_LO, _J_RATIO_HI = 1.1, 5.0
 _J_LEG_D_LO, _J_LEG_D_HI = 0.9, 5.0
-_J_LEG_T_LO, _J_LEG_T_HI = 0.05, 0.1
+_J_LEG_T_LO, _J_LEG_T_HI = 0.03, 0.1
 _J_BRACE_D_LO, _J_BRACE_D_HI = 0.5, 2.0
-_J_BRACE_T_LO, _J_BRACE_T_HI = 0.05, 0.1  # keep t < 0.5 * brace_D_lo
+_J_BRACE_T_LO, _J_BRACE_T_HI = 0.03, 0.1  # keep t < 0.5 * brace_D_lo
 _J_T_OVER_D_MAX = 0.45  # Tube Area → 0 when t >= D
+_J_D_TO_T_MAX = 100.0
+_J_ENFORCE_D_TO_T = True  # match analysis_options_jacket.yaml d_to_t upper=100
 _J_FLARE_LO, _J_FLARE_HI = 0.1, 0.15  # (r_foot - r_head) / height
 
 
@@ -1576,7 +1608,10 @@ def print_jacket_diagnostics(
     exit_mode=None,
     modeling_options: dict | None = None,
     member_diagnostics: bool = False,
+    stress_diagnostics: bool = False,
+    buckling_diagnostics: bool = False,
     buckling_util_threshold: float = 1.0,
+    stress_util_threshold: float = 1.0,
 ) -> None:
     """Log jacket exit mode, geometry, mass, f1 and peak utilizations."""
     r_head = _safe_get(wt_opt, "jacket.r_head", units="m")
@@ -1599,18 +1634,35 @@ def print_jacket_diagnostics(
         f"  [{label}] max util: stress={stress:.3f}  global_buck={buck_g:.3f}  "
         f"shell_buck={buck_s:.3f}"
     )
-    if member_diagnostics and modeling_options is not None:
-        if np.isfinite(buck_g) and buck_g >= buckling_util_threshold:
+    show_stress = stress_diagnostics or member_diagnostics
+    show_buckling = buckling_diagnostics or member_diagnostics
+    if (show_stress or show_buckling) and modeling_options is not None:
+        printed = False
+        if show_buckling and np.isfinite(buck_g) and buck_g >= buckling_util_threshold:
             print_jacket_member_buckling_diagnostics(
                 wt_opt,
                 modeling_options,
                 label=label,
                 util_threshold=buckling_util_threshold,
             )
-        elif member_diagnostics:
+            printed = True
+        if show_stress and np.isfinite(stress) and stress >= stress_util_threshold:
+            print_jacket_member_stress_diagnostics(
+                wt_opt,
+                modeling_options,
+                label=label,
+                util_threshold=stress_util_threshold,
+            )
+            printed = True
+        if not printed:
+            parts = []
+            if show_buckling:
+                parts.append(f"global>={buckling_util_threshold:.3f} (peak={buck_g:.3f})")
+            if show_stress:
+                parts.append(f"stress>={stress_util_threshold:.3f} (peak={stress:.3f})")
             print(
                 f"  [{label}] member diagnostics skipped "
-                f"(max global_buck={buck_g:.3f} < threshold={buckling_util_threshold:.3f})"
+                f"(no {' or '.join(parts)} member/DLC pairs)"
             )
 
 
@@ -1624,6 +1676,284 @@ def _get_jacket_member_arrays(wt_opt, name: str, units=None) -> np.ndarray | Non
         except Exception:
             continue
     return None
+
+
+def _jacket_dlc_names(n_dlc: int) -> list[str]:
+    names = [
+        "DLC1_rated_GustETM",
+        "DLC2_parked_extreme_V50",
+    ]
+    while len(names) < n_dlc:
+        names.append(f"DLC{len(names) + 1}")
+    return names
+
+
+def _align_jacket_member_2d(arr, n_elem: int, n_dlc: int) -> np.ndarray | None:
+    if arr is None:
+        return None
+    arr = np.atleast_2d(np.asarray(arr, dtype=float))
+    if arr.shape[0] == n_dlc and arr.shape[1] == n_elem:
+        arr = arr.T
+    if arr.shape[0] > n_elem:
+        arr = arr[:n_elem]
+    if arr.shape[1] > n_dlc:
+        arr = arr[:, :n_dlc]
+    return arr
+
+
+def _jacket_stress_gamma(modeling_options: dict) -> float:
+    fb = modeling_options.get("WISDEM", {}).get("FixedBottomSE", {})
+    return float(fb.get("gamma_f", 1.0)) * float(fb.get("gamma_m", 1.0)) * float(fb.get("gamma_n", 1.0))
+
+
+def classify_jacket_stress_governing(
+    axial_stress: float,
+    hoop_stress: float,
+    shear_stress: float,
+    sigma_y: float,
+    gamma: float,
+    axial_from_force: float,
+    bending_stress: float,
+) -> tuple[str, dict[str, float]]:
+    """
+    Classify which stress mechanism drives von Mises utilization for one member/DLC.
+
+    Replicates ``JacketPost`` / ``TubevonMisesStressUtilization`` term structure.
+    """
+    ax = float(axial_stress)
+    hoop = float(hoop_stress)
+    sh = float(shear_stress)
+    sigy = float(sigma_y)
+    if not (np.isfinite(ax) and np.isfinite(hoop) and np.isfinite(sh) and sigy > 0.0):
+        return "unknown", {}
+
+    term_mean = ((ax + hoop) / 2.0) ** 2
+    term_diff = ((ax - hoop) / 2.0) ** 2
+    term_shear = sh**2
+    vm = float(np.sqrt(term_mean + 3.0 * (term_diff + term_shear)))
+    vm2 = vm**2 if vm > 0.0 else 0.0
+
+    util_vm = gamma * vm / sigy
+    util_ax = gamma * abs(ax) / sigy
+    util_hoop = gamma * abs(hoop) / sigy
+    util_shear = gamma * np.sqrt(3.0) * abs(sh) / sigy
+
+    detail = {
+        "von_mises_MPa": vm / 1e6,
+        "axial_MPa": ax / 1e6,
+        "hoop_MPa": hoop / 1e6,
+        "shear_MPa": sh / 1e6,
+        "axial_force_MPa": float(axial_from_force) / 1e6,
+        "bending_MPa": float(bending_stress) / 1e6,
+        "util_vm": util_vm,
+        "util_axial_component": util_ax,
+        "util_hoop_component": util_hoop,
+        "util_shear_component": util_shear,
+        "vm_frac_mean_stress": float(term_mean / vm2) if vm2 > 0.0 else 0.0,
+        "vm_frac_axial_hoop_diff": float(3.0 * term_diff / vm2) if vm2 > 0.0 else 0.0,
+        "vm_frac_shear": float(3.0 * term_shear / vm2) if vm2 > 0.0 else 0.0,
+    }
+
+    if util_shear >= max(util_ax, util_hoop) and detail["vm_frac_shear"] >= 0.35:
+        governing = "shear / torsion (von Mises)"
+    elif util_hoop >= util_ax and util_hoop >= util_shear and abs(hoop) > 0.15 * max(abs(ax), 1.0):
+        governing = "hydrodynamic hoop pressure"
+    elif abs(bending_stress) > abs(axial_from_force):
+        governing = "bending-dominated von Mises"
+    elif axial_from_force < 0.0:
+        governing = "compressive axial (+ interaction)"
+    else:
+        governing = "tensile axial (+ interaction)"
+
+    return governing, detail
+
+
+def print_jacket_member_stress_diagnostics(
+    wt_opt,
+    modeling_options: dict,
+    label: str = "",
+    util_threshold: float = 1.0,
+    top_n: int = 5,
+) -> None:
+    """
+    Report which jacket members drive von Mises stress utilization and why.
+
+    Uses the same stress model as ``JacketPost`` (Frame3DD loads + DNV partial factors).
+    """
+    from wisdem.fixed_bottomse.jacket import jacket_element_metadata
+
+    fb = modeling_options.get("WISDEM", {}).get("FixedBottomSE", {})
+    n_legs = int(fb.get("n_legs", 4))
+    n_bays = int(fb.get("n_bays", 3))
+    mud_brace = bool(fb.get("mud_brace", True))
+    n_dlc = int(modeling_options.get("WISDEM", {}).get("n_dlc", 1))
+    gamma = _jacket_stress_gamma(modeling_options)
+
+    meta = jacket_element_metadata(n_legs, n_bays, mud_brace)
+    n_elem = len(meta)
+    dlc_names = _jacket_dlc_names(n_dlc)
+
+    stress = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "constr_stress"), n_elem, n_dlc)
+    if stress is None:
+        print(f"  [{label}] member diagnostics: constr_stress not available")
+        return
+
+    elem_L = _get_jacket_member_arrays(wt_opt, "jacket_elem_L", units="m")
+    elem_D = _get_jacket_member_arrays(wt_opt, "jacket_elem_D", units="m")
+    elem_t = _get_jacket_member_arrays(wt_opt, "jacket_elem_t", units="m")
+    elem_A = _get_jacket_member_arrays(wt_opt, "jacket_elem_A", units="m**2")
+    elem_Asx = _get_jacket_member_arrays(wt_opt, "jacket_elem_Asx", units="m**2")
+    elem_Iyy = _get_jacket_member_arrays(wt_opt, "jacket_elem_Iyy", units="kg*m**2")
+    elem_J0 = _get_jacket_member_arrays(wt_opt, "jacket_elem_J0", units="kg*m**2")
+    elem_sigy = _get_jacket_member_arrays(wt_opt, "jacket_elem_sigma_y", units="Pa")
+    qdyn = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_elem_qdyn", units="Pa"), n_elem, n_dlc)
+    fz = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Fz", units="N"), n_elem, n_dlc)
+    vx = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Vx", units="N"), n_elem, n_dlc)
+    vy = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Vy", units="N"), n_elem, n_dlc)
+    mxx = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Mxx", units="N*m"), n_elem, n_dlc)
+    myy = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Myy", units="N*m"), n_elem, n_dlc)
+    mzz = _align_jacket_member_2d(_get_jacket_member_arrays(wt_opt, "jacket_Mzz", units="N*m"), n_elem, n_dlc)
+
+    if elem_L is not None:
+        elem_L = np.atleast_1d(elem_L).flatten()[:n_elem]
+    if elem_D is not None:
+        elem_D = np.atleast_1d(elem_D).flatten()[:n_elem]
+    if elem_t is not None:
+        elem_t = np.atleast_1d(elem_t).flatten()[:n_elem]
+    if elem_A is not None:
+        elem_A = np.atleast_1d(elem_A).flatten()[:n_elem]
+    if elem_Asx is not None:
+        elem_Asx = np.atleast_1d(elem_Asx).flatten()[:n_elem]
+    if elem_Iyy is not None:
+        elem_Iyy = np.atleast_1d(elem_Iyy).flatten()[:n_elem]
+    if elem_J0 is not None:
+        elem_J0 = np.atleast_1d(elem_J0).flatten()[:n_elem]
+    if elem_sigy is not None:
+        elem_sigy = np.atleast_1d(elem_sigy).flatten()[:n_elem]
+
+    pairs = []
+    for i in range(min(n_elem, stress.shape[0])):
+        for k in range(min(n_dlc, stress.shape[1])):
+            util_st = float(stress[i, k])
+            if np.isfinite(util_st) and util_st >= util_threshold:
+                pairs.append((util_st, i, k))
+    pairs.sort(reverse=True)
+
+    tag = f"[{label}] " if label else ""
+    print(f"\n  {tag}=== Jacket member stress diagnostics (von Mises util >= {util_threshold:.2f}) ===")
+    print(
+        f"  {tag}Check model: DNV partial factors γ_f·γ_m·γ_n={gamma:.3f} on von Mises stress "
+        f"(σ_vm = sqrt(((σ_ax+σ_h)/2)² + 3·(((σ_ax-σ_h)/2)² + τ²)); util = γ·σ_vm/σ_y)."
+    )
+    print(
+        f"  {tag}Stress components match JacketPost: "
+        "σ_ax = Fz/A + M·r/Iyy; τ = |Mzz|/(J·r) + V/Asx; σ_h = -q_dyn·r/t."
+    )
+
+    if not pairs:
+        max_st = float(np.nanmax(stress)) if stress.size else float("nan")
+        print(f"  {tag}No member/DLC pairs above threshold (peak stress util={max_st:.3f}).")
+        return
+
+    show = pairs[:top_n]
+    print(f"  {tag}Top {len(show)} critical member(s) by von Mises stress utilization:\n")
+    for rank, (util_st, i, k) in enumerate(show, start=1):
+        m = meta[i]
+        L = float(elem_L[i]) if elem_L is not None else float("nan")
+        D = float(elem_D[i]) if elem_D is not None else float("nan")
+        t = float(elem_t[i]) if elem_t is not None else float("nan")
+        sigy = float(elem_sigy[i]) if elem_sigy is not None else float("nan")
+        r = 0.5 * D if np.isfinite(D) else float("nan")
+
+        axial = float(fz[i, k]) if fz is not None else float("nan")
+        if mxx is not None and myy is not None:
+            moment = float(np.hypot(mxx[i, k], myy[i, k]))
+        else:
+            moment = float("nan")
+        if vx is not None and vy is not None:
+            shear_force = float(np.hypot(vx[i, k], vy[i, k]))
+        else:
+            shear_force = float("nan")
+        torsion = float(mzz[i, k]) if mzz is not None else float("nan")
+        q = float(qdyn[i, k]) if qdyn is not None else float("nan")
+
+        Az = float(elem_A[i]) if elem_A is not None else float("nan")
+        Asx = float(elem_Asx[i]) if elem_Asx is not None else float("nan")
+        Iyy = float(elem_Iyy[i]) if elem_Iyy is not None else float("nan")
+        Jz = float(elem_J0[i]) if elem_J0 is not None else float("nan")
+
+        axial_force_stress = float("nan")
+        bending_stress = float("nan")
+        axial_stress = float("nan")
+        hoop_stress = float("nan")
+        shear_stress = float("nan")
+        if (
+            np.isfinite(Az)
+            and Az > 0.0
+            and np.isfinite(Iyy)
+            and Iyy > 0.0
+            and np.isfinite(r)
+            and np.isfinite(axial)
+            and np.isfinite(moment)
+        ):
+            axial_force_stress = axial / Az
+            bending_stress = moment * (r / Iyy)
+            axial_stress = axial_force_stress + bending_stress
+        if np.isfinite(q) and np.isfinite(r) and np.isfinite(t) and t > 0.0:
+            hoop_stress = -q * ((r - 0.5 * t) / t)
+        if all(np.isfinite(x) and x > 0.0 for x in (Jz, r, Asx)):
+            shear_stress = abs(torsion) / (Jz * r) + (
+                shear_force / Asx if np.isfinite(shear_force) else 0.0
+            )
+
+        governing, detail = classify_jacket_stress_governing(
+            axial_stress,
+            hoop_stress,
+            shear_stress,
+            sigy,
+            gamma,
+            axial_force_stress,
+            bending_stress,
+        )
+
+        dlc_label = dlc_names[k] if k < len(dlc_names) else f"DLC{k + 1}"
+        extreme_note = (
+            "parked extreme (V50 thrust + RNA weight)"
+            if "parked" in dlc_label or k == 1
+            else "rated operational (GustETM RNA + rated wind)"
+        )
+        slenderness_ld = L / D if np.isfinite(L) and np.isfinite(D) and D > 0 else float("nan")
+
+        print(f"  {tag}#{rank}  {m['label']}  (elem {i}, {dlc_label})")
+        print(f"  {tag}    Member type: {m['member_type']}")
+        print(
+            f"  {tag}    Geometry: L={L:.3f} m, D={D:.3f} m, t={t*1e3:.1f} mm, "
+            f"L/D={slenderness_ld:.1f}, σ_y={sigy/1e6:.0f} MPa"
+        )
+        print(
+            f"  {tag}    Loads: Fz={axial/1e3:.1f} kN axial, |M|={moment/1e3:.1f} kN·m, "
+            f"|V|={shear_force/1e3:.1f} kN, |Mzz|={abs(torsion)/1e3:.1f} kN·m, q_dyn={q/1e3:.1f} kPa"
+        )
+        print(
+            f"  {tag}    Stress components: σ_ax={detail.get('axial_MPa', float('nan')):.2f} MPa "
+            f"(F/A={detail.get('axial_force_MPa', float('nan')):.2f}, "
+            f"M·r/I={detail.get('bending_MPa', float('nan')):.2f}), "
+            f"σ_h={detail.get('hoop_MPa', float('nan')):.2f} MPa, "
+            f"τ={detail.get('shear_MPa', float('nan')):.2f} MPa"
+        )
+        print(
+            f"  {tag}    Component util (γ·|σ|/σ_y): axial={detail.get('util_axial_component', float('nan')):.3f}  "
+            f"hoop={detail.get('util_hoop_component', float('nan')):.3f}  "
+            f"shear≈{detail.get('util_shear_component', float('nan')):.3f}  "
+            f"von Mises={util_st:.3f}"
+        )
+        print(
+            f"  {tag}    von Mises term fractions: mean={detail.get('vm_frac_mean_stress', 0.0):.2f}  "
+            f"axial–hoop diff={detail.get('vm_frac_axial_hoop_diff', 0.0):.2f}  "
+            f"shear={detail.get('vm_frac_shear', 0.0):.2f}  → governing: {governing}"
+        )
+        print(f"  {tag}    Load case: {dlc_label} ({extreme_note})")
+        print("")
 
 
 def print_jacket_member_buckling_diagnostics(
@@ -1678,30 +2008,13 @@ def print_jacket_member_buckling_diagnostics(
     if buck_g.shape[1] > n_dlc:
         buck_g = buck_g[:, :n_dlc]
 
-    dlc_names = [
-        "DLC1_rated_GustETM",
-        "DLC2_parked_extreme_V50",
-    ]
-    while len(dlc_names) < n_dlc:
-        dlc_names.append(f"DLC{len(dlc_names) + 1}")
+    dlc_names = _jacket_dlc_names(n_dlc)
 
-    def _align_member_2d(arr):
-        if arr is None:
-            return None
-        arr = np.atleast_2d(np.asarray(arr, dtype=float))
-        if arr.shape[0] == n_dlc and arr.shape[1] == n_elem:
-            arr = arr.T
-        if arr.shape[0] > n_elem:
-            arr = arr[:n_elem]
-        if arr.shape[1] > n_dlc:
-            arr = arr[:, :n_dlc]
-        return arr
-
-    buck_s = _align_member_2d(buck_s)
-    stress = _align_member_2d(stress)
-    fz = _align_member_2d(fz)
-    mxx = _align_member_2d(mxx)
-    myy = _align_member_2d(myy)
+    buck_s = _align_jacket_member_2d(buck_s, n_elem, n_dlc)
+    stress = _align_jacket_member_2d(stress, n_elem, n_dlc)
+    fz = _align_jacket_member_2d(fz, n_elem, n_dlc)
+    mxx = _align_jacket_member_2d(mxx, n_elem, n_dlc)
+    myy = _align_jacket_member_2d(myy, n_elem, n_dlc)
     # Ghost members are the last n_legs elements; structural checks omit them.
     if elem_L is not None:
         elem_L = np.atleast_1d(elem_L).flatten()[:n_elem]
@@ -1802,6 +2115,118 @@ def print_jacket_member_buckling_diagnostics(
         print("")
 
 
+def _apply_jacket_frequency_nudge(
+    wt: dict, f1: float, f_lo: float, f_hi: float
+) -> tuple[dict, bool]:
+    """
+    One-step geometry tweak to move jacket f1 toward the soft-stiff band.
+
+    Returns (updated_wt, changed).
+    """
+    if not (np.isfinite(f1) and np.isfinite(f_lo) and np.isfinite(f_hi)):
+        return wt, False
+    if f_lo <= f1 <= f_hi:
+        return wt, False
+
+    jacket = wt["components"]["jacket"]
+    r_head = float(jacket["r_head"])
+    ratio = float(jacket["r_foot"]) / r_head if r_head > 0 else 1.5
+    leg_d = float(jacket["leg_diameter"])
+    brace_d0 = float(jacket["brace_diameters"][0])
+    height = float(jacket.get("height", 40.0)) or 40.0
+
+    r_new, ratio_new = r_head, ratio
+    leg_d_new = leg_d
+    brace_d_new = brace_d0
+
+    if f1 < f_lo:
+        # Too soft: widen base and fatten members (keep within flare band)
+        ratio_new = _clip(ratio + 0.15, _J_RATIO_LO, _J_RATIO_HI)
+        flare_new = (r_new * (ratio_new - 1.0)) / height if height > 0 else 0.0
+        if flare_new > _J_FLARE_HI:
+            ratio_new = _clip(
+                1.0 + _J_FLARE_HI * height / max(r_new, 1e-6), _J_RATIO_LO, _J_RATIO_HI
+            )
+        r_new = _clip(r_head + 0.25, _J_RHEAD_LO, _J_RHEAD_HI)
+        leg_d_new = _clip(leg_d + 0.2, _J_LEG_D_LO, _J_LEG_D_HI)
+        brace_d_new = _clip(brace_d0 + 0.1, _J_BRACE_D_LO, _J_BRACE_D_HI)
+    elif f1 > f_hi:
+        # Too stiff: trim flare / members (keep r_head >= D_tower)
+        ratio_new = _clip(ratio - 0.1, _J_RATIO_LO, _J_RATIO_HI)
+        flare_new = (r_head * (ratio_new - 1.0)) / height if height > 0 else 0.0
+        if flare_new < _J_FLARE_LO:
+            ratio_new = _clip(
+                1.0 + _J_FLARE_LO * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI
+            )
+        d_tow = tower_base_diameter_from_geom(wt)
+        r_new = _clip(max(d_tow, r_head - 0.25), _J_RHEAD_LO, _J_RHEAD_HI)
+        leg_d_new = _clip(leg_d * 0.95, _J_LEG_D_LO, _J_LEG_D_HI)
+        brace_d_new = _clip(brace_d0 * 0.95, _J_BRACE_D_LO, _J_BRACE_D_HI)
+
+    d_tow = tower_base_diameter_from_geom(wt)
+    r_new = max(r_new, d_tow)
+    leg_t = float(jacket["leg_thickness"])
+    brace_t0 = float(jacket["brace_thicknesses"][0])
+    unchanged = (
+        abs(r_new - r_head) < 1e-9
+        and abs(ratio_new - ratio) < 1e-12
+        and abs(leg_d_new - leg_d) < 1e-9
+        and abs(brace_d_new - brace_d0) < 1e-12
+    )
+    if unchanged:
+        return wt, False
+
+    wt_new = seed_jacket_geometry(
+        wt,
+        r_new,
+        ratio_new,
+        leg_d_new,
+        leg_t,
+        [brace_d_new],
+        [brace_t0],
+    )
+    return wt_new, True
+
+
+def repair_jacket_frequency_start(
+    run_wisdem,
+    wt_geom: dict,
+    modeling: dict,
+    analysis: dict,
+    modeling_out: str,
+    tag: str,
+    f_lo: float,
+    f_hi: float,
+    max_passes: int = 6,
+) -> dict:
+    """Run-only nudges after Stage 1 so Stage 2 frequency SLSQP starts near the band."""
+    wt = copy.deepcopy(wt_geom)
+    analysis_ro = analysis_jacket_run_only(analysis)
+    analysis_ro.setdefault("general", {})
+    analysis_ro["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_preflight")
+    analysis_ro["general"]["fname_output"] = "refturb_output"
+    analysis_path = os.path.join(TMP_DIR, f"analysis_{tag}_preflight.yaml")
+    dump_yaml(analysis_ro, analysis_path)
+
+    for i in range(max_passes):
+        geom_path = os.path.join(TMP_DIR, f"geometry_{tag}_preflight_{i}.yaml")
+        dump_yaml(wt, geom_path)
+        wt_opt, _, _ = run_wisdem(geom_path, modeling_out, analysis_path, run_only=True)
+        f1 = _safe_get(wt_opt, "fixedse.structural_frequencies")
+        print(f"  [freq repair {i}] f1={f1:.4f} Hz  band=[{f_lo:.4f}, {f_hi:.4f}]")
+        if np.isfinite(f1) and f_lo <= f1 <= f_hi:
+            print("  Frequency repair: f1 is within band for Stage 2")
+            return wt
+        wt_new, changed = _apply_jacket_frequency_nudge(wt, f1, f_lo, f_hi)
+        if not changed:
+            print("  Frequency repair: bounds hit; continuing with best-effort start")
+            return wt
+        wt = wt_new
+
+    print("  Frequency repair: max passes reached; continuing with best-effort start")
+    return wt
+
+
 def repair_feasible_jacket_start(
     run_wisdem,
     wt_geom: dict,
@@ -1812,12 +2237,14 @@ def repair_feasible_jacket_start(
     f_lo: float,
     f_hi: float,
     max_passes: int = 8,
+    member_diagnostics: bool = False,
+    stress_diagnostics: bool = False,
+    buckling_diagnostics: bool = False,
+    buckling_util_threshold: float = 1.0,
+    stress_util_threshold: float = 1.0,
 ) -> dict:
-    """Nudge jacket DVs with run_only analyses until util/f1 look roughly feasible."""
+    """Nudge jacket DVs with run_only analyses until strength util looks roughly feasible."""
     wt = copy.deepcopy(wt_geom)
-    freq_on = bool(
-        analysis.get("constraints", {}).get("jacket", {}).get("frequency_1", {}).get("flag", False)
-    )
     analysis_ro = analysis_jacket_run_only(analysis)
     analysis_ro.setdefault("general", {})
     analysis_ro["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_preflight")
@@ -1847,17 +2274,27 @@ def repair_feasible_jacket_start(
             f"util={util:.3f} (stress/shell={strength_util:.3f}, global_buck={global_buck:.3f})  "
             f"f1={f1:.4f} Hz"
         )
-        if jacket_preflight_is_ready(wt_opt, f_lo, f_hi, check_frequency=freq_on):
+        if jacket_preflight_is_ready(wt_opt, f_lo, f_hi, check_frequency=False):
             print("  Preflight: start is feasible enough for SLSQP")
             return wt
 
+        show_stress = stress_diagnostics or member_diagnostics
+        show_buckling = buckling_diagnostics or member_diagnostics
         global_buck_diag = max_jacket_global_buckling_util(wt_opt)
-        if np.isfinite(global_buck_diag) and global_buck_diag >= _PREFLIGHT_GLOBAL_BUCK_TARGET:
+        strength_diag = max_jacket_strength_util(wt_opt)
+        if show_buckling and np.isfinite(global_buck_diag) and global_buck_diag >= buckling_util_threshold:
             print_jacket_member_buckling_diagnostics(
                 wt_opt,
                 modeling,
                 label=f"preflight {i}",
-                util_threshold=1.0,
+                util_threshold=buckling_util_threshold,
+            )
+        if show_stress and np.isfinite(strength_diag) and strength_diag >= stress_util_threshold:
+            print_jacket_member_stress_diagnostics(
+                wt_opt,
+                modeling,
+                label=f"preflight {i}",
+                util_threshold=stress_util_threshold,
             )
 
         r_new, ratio_new = r_head, ratio
@@ -1883,31 +2320,6 @@ def repair_feasible_jacket_start(
             )
             if scale > 1.5 and np.isfinite(global_buck) and global_buck > 1.0:
                 print(f"  [preflight {i}] aggressive scale={scale:.3f} for global_buck={global_buck:.3f}")
-
-        if freq_on and np.isfinite(f1) and f1 < f_lo:
-            # Too soft: widen base and fatten members (keep within flare band)
-            ratio_new = _clip(ratio + 0.15, _J_RATIO_LO, _J_RATIO_HI)
-            flare_new = (r_new * (ratio_new - 1.0)) / height if height > 0 else 0.0
-            if flare_new > _J_FLARE_HI:
-                ratio_new = _clip(
-                    1.0 + _J_FLARE_HI * height / max(r_new, 1e-6), _J_RATIO_LO, _J_RATIO_HI
-                )
-            r_new = _clip(r_head + 0.25, _J_RHEAD_LO, _J_RHEAD_HI)
-            leg_d_new = _clip(max(leg_d_new, leg_d + 0.2), _J_LEG_D_LO, _J_LEG_D_HI)
-            brace_d_new = _clip(max(brace_d_new, brace_d0 + 0.1), _J_BRACE_D_LO, _J_BRACE_D_HI)
-        elif freq_on and np.isfinite(f1) and f1 > f_hi:
-            # Too stiff: trim flare / members (keep r_head >= D_tower)
-            d_tow = tower_base_diameter_from_geom(wt)
-            ratio_new = _clip(ratio - 0.1, _J_RATIO_LO, _J_RATIO_HI)
-            flare_new = (r_head * (ratio_new - 1.0)) / height if height > 0 else 0.0
-            if flare_new < _J_FLARE_LO:
-                ratio_new = _clip(
-                    1.0 + _J_FLARE_LO * height / max(r_head, 1e-6), _J_RATIO_LO, _J_RATIO_HI
-                )
-            r_new = _clip(max(d_tow, r_head - 0.25), _J_RHEAD_LO, _J_RHEAD_HI)
-            if not (scale > 1.0):
-                leg_d_new = _clip(leg_d * 0.95, _J_LEG_D_LO, _J_LEG_D_HI)
-                brace_d_new = _clip(brace_d0 * 0.95, _J_BRACE_D_LO, _J_BRACE_D_HI)
 
         d_tow = tower_base_diameter_from_geom(wt)
         r_new = max(r_new, d_tow)
@@ -1942,15 +2354,32 @@ def run_jacket_two_stage(
     f_lo: float,
     f_hi: float,
     member_diagnostics: bool = False,
+    stress_diagnostics: bool = False,
+    buckling_diagnostics: bool = False,
     buckling_util_threshold: float = 1.0,
+    stress_util_threshold: float = 1.0,
 ) -> tuple:
     """
-    Preflight feasible seed -> Stage 1 (shorter) -> Stage 2 polish.
+    Preflight feasible seed -> Stage 1 (stress/shell/flare) ->
+    optional frequency repair -> Stage 2 (global buckling + frequency).
     Returns (wt_opt, modeling_options, opt_exit_mode, jacket_dv_tuple).
     """
+    freq_on = jacket_frequency_enabled(analysis)
     print("  Preflight feasible-start repair …")
     wt_geom = repair_feasible_jacket_start(
-        run_wisdem, wt_geom, modeling, analysis, modeling_out, tag, f_lo, f_hi
+        run_wisdem,
+        wt_geom,
+        modeling,
+        analysis,
+        modeling_out,
+        tag,
+        f_lo,
+        f_hi,
+        member_diagnostics=member_diagnostics,
+        stress_diagnostics=stress_diagnostics,
+        buckling_diagnostics=buckling_diagnostics,
+        buckling_util_threshold=buckling_util_threshold,
+        stress_util_threshold=stress_util_threshold,
     )
 
     analysis_s1 = analysis_jacket_stage1(analysis)
@@ -1962,7 +2391,7 @@ def run_jacket_two_stage(
     dump_yaml(analysis_s1, analysis_s1_path)
     dump_yaml(wt_geom, wt_s1_path)
 
-    print("  Stage 1 (stress/shell/flare; global buckling off, shorter budget) …")
+    print("  Stage 1 (stress/shell/flare; global buckling and frequency off, shorter budget) …")
     wt_opt, modeling_options, _opt = run_wisdem(wt_s1_path, modeling_out, analysis_s1_path)
     exit1 = get_opt_exit_mode(wt_opt)
     print_jacket_diagnostics(
@@ -1973,13 +2402,28 @@ def run_jacket_two_stage(
         exit_mode=exit1,
         modeling_options=modeling_options,
         member_diagnostics=member_diagnostics,
+        stress_diagnostics=stress_diagnostics,
+        buckling_diagnostics=buckling_diagnostics,
         buckling_util_threshold=buckling_util_threshold,
+        stress_util_threshold=stress_util_threshold,
     )
 
     r_head, ratio, leg_d, leg_t, brace_d, brace_t = extract_jacket_dvs(wt_opt)
     wt_after_s1 = seed_jacket_geometry(
         wt_geom, r_head, ratio, leg_d, leg_t, brace_d, brace_t
     )
+    if freq_on:
+        print("  Frequency band repair before Stage 2 …")
+        wt_after_s1 = repair_jacket_frequency_start(
+            run_wisdem,
+            wt_after_s1,
+            modeling,
+            analysis,
+            modeling_out,
+            f"{tag}_f1",
+            f_lo,
+            f_hi,
+        )
 
     analysis_s2 = analysis_jacket_stage2(analysis)
     analysis_s2.setdefault("general", {})
@@ -1993,8 +2437,12 @@ def run_jacket_two_stage(
     global_on = bool(
         analysis.get("constraints", {}).get("jacket", {}).get("global_buckling", {}).get("flag", False)
     )
-    if global_on:
+    if global_on and freq_on:
+        print("  Stage 2 (global buckling + frequency, polish) …")
+    elif global_on:
         print("  Stage 2 (full constraints incl. global buckling, polish) …")
+    elif freq_on:
+        print("  Stage 2 (frequency + remaining constraints, polish) …")
     else:
         print("  Stage 2 (full constraints, polish) …")
     wt_opt, modeling_options, _opt = run_wisdem(wt_s2_path, modeling_out, analysis_s2_path)
@@ -2007,7 +2455,10 @@ def run_jacket_two_stage(
         exit_mode=exit2,
         modeling_options=modeling_options,
         member_diagnostics=member_diagnostics,
+        stress_diagnostics=stress_diagnostics,
+        buckling_diagnostics=buckling_diagnostics,
         buckling_util_threshold=buckling_util_threshold,
+        stress_util_threshold=stress_util_threshold,
     )
 
     dvs = extract_jacket_dvs(wt_opt)
@@ -2123,8 +2574,13 @@ def compute_loads_stage(
     return loads
 
 
-def scenario_result_extras(scenario: dict, loads: dict, f_lo: float = None, f_hi: float = None, exit_mode=None) -> dict:
-    """Site + tower-base load fields written into results_monopile.csv, results_jacket.csv, or results_jacket_3.csv."""
+def scenario_result_extras(
+    scenario: dict,
+    loads: dict,
+    exit_mode=None,
+    rna_mass_kg: float | None = None,
+) -> dict:
+    """Site + tower-base load fields written into the type-specific results CSV."""
     extras = {
         "tower_base_shear_N": loads["shear_N"],
         "tower_base_vertical_N": loads["vertical_N"],
@@ -2135,6 +2591,8 @@ def scenario_result_extras(scenario: dict, loads: dict, f_lo: float = None, f_hi
         "soil_shear_modulus_Pa": _to_float(scenario["soil_shear_modulus_Pa"]),
         "water_depth_m": _to_float(scenario["water_depth_m"]),
     }
+    if rna_mass_kg is not None and not (isinstance(rna_mass_kg, float) and not math.isfinite(rna_mass_kg)):
+        extras["rna_mass_kg"] = float(rna_mass_kg)
     if exit_mode is not None and not (isinstance(exit_mode, float) and not math.isfinite(exit_mode)):
         try:
             extras["opt_exit_mode"] = int(exit_mode)
@@ -2151,7 +2609,10 @@ def run_batch(
     stop_on_error: bool = False,
     row_filter: int | None = None,
     member_diagnostics: bool = False,
+    stress_diagnostics: bool = False,
+    buckling_diagnostics: bool = False,
     buckling_util_threshold: float = 1.0,
+    stress_util_threshold: float = 1.0,
 ) -> int:
     run_wisdem, append_foundation_results, cdr = _setup_wisdem()
     scenarios = read_scenarios(csv_path)
@@ -2177,10 +2638,15 @@ def run_batch(
     print(f"Loaded {len(scenarios)} scenario row(s) from {csv_path}")
     if row_filter is not None:
         print(f"  (--row {row_filter}: running that CSV line only)")
-    if member_diagnostics and "jacket" in foundations:
-        print(
-            f"  Member buckling diagnostics enabled when global util >= {buckling_util_threshold:.2f}"
-        )
+    show_stress = stress_diagnostics or member_diagnostics
+    show_buckling = buckling_diagnostics or member_diagnostics
+    if (show_stress or show_buckling) and "jacket" in foundations:
+        parts = []
+        if show_stress:
+            parts.append(f"stress >= {stress_util_threshold:.2f}")
+        if show_buckling:
+            parts.append(f"global buckling >= {buckling_util_threshold:.2f}")
+        print(f"  Jacket member diagnostics enabled when {' and '.join(parts)}")
     print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
     if "jacket" in foundations:
@@ -2193,7 +2659,10 @@ def run_batch(
         row_num = scenario["_csv_row_number"]
         rating = _to_float(scenario["turbine_rating_W"])
         turb_name, turb_params = lookup_turbine_column(turbines, rating, turbine_csv)
+        rna_mass_kg = lookup_rna_mass(turb_params)
         print(f"\n### CSV row {row_num}: rating={rating:g} W -> turbine '{turb_name}' ###")
+        if math.isfinite(rna_mass_kg):
+            print(f"  RNA mass (lookup) = {rna_mass_kg:.6g} kg")
 
         jacket_loads = None
 
@@ -2325,7 +2794,9 @@ def run_batch(
                                 "next soil row will cold-start"
                             )
                             mono_warmstart.pop(ws_key, None)
-                        extras = scenario_result_extras(scenario, loads, f_lo, f_hi, exit_mode=exit_mode)
+                        extras = scenario_result_extras(
+                            scenario, loads, exit_mode=exit_mode, rna_mass_kg=rna_mass_kg
+                        )
                         out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
                     else:
                         wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
@@ -2338,14 +2809,12 @@ def run_batch(
                             f_lo,
                             f_hi,
                             member_diagnostics=member_diagnostics,
+                            stress_diagnostics=stress_diagnostics,
+                            buckling_diagnostics=buckling_diagnostics,
                             buckling_util_threshold=buckling_util_threshold,
+                            stress_util_threshold=stress_util_threshold,
                         )
-                        freq_on = bool(
-                            analysis.get("constraints", {})
-                            .get("jacket", {})
-                            .get("frequency_1", {})
-                            .get("flag", False)
-                        )
+                        freq_on = jacket_frequency_enabled(analysis)
                         if design_is_warmstart_safe(wt_opt, f_lo, f_hi, check_frequency=freq_on):
                             r_h, ratio, leg_d, leg_t, brace_d, brace_t = j_dvs
                             jacket_warmstart[ws_key] = (
@@ -2365,7 +2834,7 @@ def run_batch(
                             )
                             jacket_warmstart.pop(ws_key, None)
                         extras = scenario_result_extras(
-                            scenario, loads, f_lo, f_hi, exit_mode=exit_mode
+                            scenario, loads, exit_mode=exit_mode, rna_mass_kg=rna_mass_kg
                         )
                         out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
 
@@ -2374,7 +2843,7 @@ def run_batch(
                         print(
                             f"  NOTE: optimizer exit_mode={exit_mode} "
                             "(0=success; 8=linesearch stuck; 9=iteration limit). "
-                            "Row was still appended — check opt_exit_mode / f1_Hz in CSV."
+                            "Row was still appended — check opt_exit_mode in CSV."
                         )
                     n_ok += 1
                 except Exception as exc:
@@ -2437,20 +2906,41 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--member-diagnostics",
+        "--stress-diagnostics",
         action="store_true",
         help=(
-            "For jacket runs, print per-member buckling details when global utilization "
-            "exceeds --buckling-util-threshold (also prints during preflight when util >= 2)."
+            "For jacket runs, print per-member von Mises stress details when utilization "
+            "exceeds --stress-util-threshold (no global buckling member output)."
         ),
+    )
+    parser.add_argument(
+        "--buckling-diagnostics",
+        action="store_true",
+        help=(
+            "For jacket runs, print per-member global buckling details when utilization "
+            "exceeds --buckling-util-threshold (no stress member output)."
+        ),
+    )
+    parser.add_argument(
+        "--member-diagnostics",
+        action="store_true",
+        help="Shorthand for --stress-diagnostics and --buckling-diagnostics together.",
     )
     parser.add_argument(
         "--buckling-util-threshold",
         type=float,
         default=1.0,
-        help="Global buckling utilization threshold for --member-diagnostics (default: 1.0).",
+        help="Global buckling utilization threshold for --buckling-diagnostics (default: 1.0).",
+    )
+    parser.add_argument(
+        "--stress-util-threshold",
+        type=float,
+        default=1.0,
+        help="von Mises stress utilization threshold for --stress-diagnostics (default: 1.0).",
     )
     args = parser.parse_args(argv)
+    stress_diagnostics = args.stress_diagnostics or args.member_diagnostics
+    buckling_diagnostics = args.buckling_diagnostics or args.member_diagnostics
     return run_batch(
         args.input_csv,
         turbine_csv=args.turbine_csv,
@@ -2459,7 +2949,10 @@ def main(argv: list[str] | None = None) -> int:
         stop_on_error=args.stop_on_error,
         row_filter=args.row,
         member_diagnostics=args.member_diagnostics,
+        stress_diagnostics=stress_diagnostics,
+        buckling_diagnostics=buckling_diagnostics,
         buckling_util_threshold=args.buckling_util_threshold,
+        stress_util_threshold=args.stress_util_threshold,
     )
 
 

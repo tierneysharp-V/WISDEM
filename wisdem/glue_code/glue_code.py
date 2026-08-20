@@ -644,6 +644,7 @@ class WT_RNTA(om.Group):
             self.connect("jacket.brace_thicknesses", "fixedse.brace_thicknesses")
             self.connect("jacket.bay_spacing", "fixedse.bay_spacing")
             self.connect("jacket.jacket_mass_user", "fixedse.jacket_mass_user")
+            self.connect("jacket.outfitting_factor", "fixedse.outfitting_factor_in")
 
         if modeling_options["flags"]["floating"]:
             self.connect("env.rho_water", "floatingse.rho_water")

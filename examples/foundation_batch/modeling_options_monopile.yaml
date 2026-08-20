@@ -1,4 +1,4 @@
-# Loading-driven monopile baseline for foundation batch sensitivity runs
+# Loading-driven monopile baseline for foundation batch runs
 # Runtime: run_foundation_batch sets n_dlc=2 (rated GustETM + parked extreme at V50)
 General:
     verbosity: False

@@ -2288,7 +2288,9 @@ class Jacket(om.Group):
             desc="Bay nodal spacing. Array starts at the bottom of the jacket.",
         )
         ivc.add_output(
-            "outfitting_factor", val=0.0, desc="Multiplier that accounts for secondary structure mass inside of jacket"
+            "outfitting_factor",
+            val=1.1,
+            desc="Multiplier that accounts for secondary structure mass on the jacket",
         )
         ivc.add_output("transition_piece_mass", val=0.0, units="kg", desc="point mass of transition piece")
         ivc.add_output("transition_piece_cost", val=0.0, units="USD", desc="cost of transition piece")

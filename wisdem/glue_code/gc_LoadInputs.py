@@ -1377,6 +1377,7 @@ class WindTurbineOntologyPython(object):
             self.wt_init["components"]["jacket"]["brace_diameters"] = wt_opt["jacket.brace_diameters"].tolist()
             self.wt_init["components"]["jacket"]["brace_thicknesses"] = wt_opt["jacket.brace_thicknesses"].tolist()
             self.wt_init["components"]["jacket"]["bay_spacing"] = wt_opt["jacket.bay_spacing"].tolist()
+            self.wt_init["components"]["jacket"]["outfitting_factor"] = float(wt_opt["jacket.outfitting_factor"][0])
 
         # Update floating platform and mooring
         if self.modeling_options["flags"]["floating"]:

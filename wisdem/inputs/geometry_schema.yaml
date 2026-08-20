@@ -595,6 +595,11 @@ properties:
                         units: kg
                         description: Override bottom-up calculation of total jacket mass with this value
                         minimum: 0.0
+                    outfitting_factor:
+                        type: number
+                        default: 1.1
+                        description: Multiplier on jacket steel mass for secondary structure / outfitting
+                        minimum: 1.0
 
     control:
         type: object

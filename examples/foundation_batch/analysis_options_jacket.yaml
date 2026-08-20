@@ -14,7 +14,7 @@ design_variables:
             upper_bound: 20.
         leg_thickness:
             flag: True
-            lower_bound: 0.05
+            lower_bound: 0.03
             upper_bound: 0.1
         leg_diameter:
             flag: True
@@ -26,7 +26,7 @@ design_variables:
             upper_bound: 2.
         brace_thicknesses:
             flag: True
-            lower_bound: 0.05
+            lower_bound: 0.03
             # Must stay < 0.5 * brace_diameters.lower_bound or Tube Area → 0
             upper_bound: 0.1
         # Height and bay spacing set by conceptual design rules; not DVs
@@ -62,6 +62,10 @@ constraints:
             upper_bound: 0.15
         tower_diameter_coupling:
             flag: True
+        d_to_t:
+            flag: True
+            lower_bound: 1.0
+            upper_bound: 100.0
         # Freeboard pre-set by conceptual design rules
         height_airgap:
             flag: False

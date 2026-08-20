@@ -1132,6 +1132,7 @@ def assign_jacket_values(wt_opt, modeling_options, jacket):
     wt_opt["jacket.brace_thicknesses"] = jacket["brace_thicknesses"]
     wt_opt["jacket.bay_spacing"] = jacket["bay_spacing"]
     wt_opt["jacket.jacket_mass_user"] = jacket["jacket_mass_user"]
+    wt_opt["jacket.outfitting_factor"] = jacket.get("outfitting_factor", 1.1)
 
     return wt_opt
 
