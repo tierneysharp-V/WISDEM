@@ -6,6 +6,7 @@ Usage:
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation jacket
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation monopile
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation both
+  python run_foundation_batch.py DOE_scenarios_500.csv --doe-results
 
 Site CSV columns (required):
   turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m
@@ -87,6 +88,7 @@ BASELINES = {
 MODELING_ROTORSE = os.path.join(BATCH_DIR, "modeling_options_rotorse.yaml")
 ANALYSIS_LOADS = os.path.join(BATCH_DIR, "analysis_options_loads.yaml")
 DEFAULT_TURBINE_CSV = os.path.join(BATCH_DIR, "turbine_lookup.csv")
+DOE_RESULTS_PREFIX = os.path.join(BATCH_DIR, "DOE_results")
 
 STAGE1_MAX_ITER = 50
 _WARMSTART_MAX_UTIL = 1.05
@@ -2601,6 +2603,22 @@ def scenario_result_extras(
     return extras
 
 
+def resolve_results_prefix(doe_results: bool = False, results_prefix: str | None = None) -> str | None:
+    """Stem for opt-in result CSVs, or None to keep the default examples/results_*.csv files.
+
+    A bare name such as ``DOE_results`` is resolved next to this script. A path
+    with a directory (relative or absolute) is kept as given.
+    """
+    if results_prefix:
+        prefix = results_prefix
+        if not os.path.isabs(prefix) and os.path.dirname(prefix) == "":
+            prefix = os.path.join(BATCH_DIR, prefix)
+        return prefix
+    if doe_results:
+        return DOE_RESULTS_PREFIX
+    return None
+
+
 def run_batch(
     csv_path: str,
     turbine_csv: str,
@@ -2613,6 +2631,7 @@ def run_batch(
     buckling_diagnostics: bool = False,
     buckling_util_threshold: float = 1.0,
     stress_util_threshold: float = 1.0,
+    results_prefix: str | None = None,
 ) -> int:
     run_wisdem, append_foundation_results, cdr = _setup_wisdem()
     scenarios = read_scenarios(csv_path)
@@ -2649,6 +2668,10 @@ def run_batch(
         print(f"  Jacket member diagnostics enabled when {' and '.join(parts)}")
     print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
+    if results_prefix:
+        print(f"Results CSVs: {results_prefix}_{{jacket,jacket_3,monopile}}.csv")
+    else:
+        print("Results CSVs: examples/results_{jacket,jacket_3,monopile}.csv")
     if "jacket" in foundations:
         print(
             f"Jacket leg counts: --jacket-legs={jacket_legs_mode} "
@@ -2797,7 +2820,12 @@ def run_batch(
                         extras = scenario_result_extras(
                             scenario, loads, exit_mode=exit_mode, rna_mass_kg=rna_mass_kg
                         )
-                        out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
+                        out_csv = append_foundation_results(
+                            wt_opt,
+                            modeling_options,
+                            extras=extras,
+                            results_prefix=results_prefix,
+                        )
                     else:
                         wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
                             run_wisdem,
@@ -2836,7 +2864,12 @@ def run_batch(
                         extras = scenario_result_extras(
                             scenario, loads, exit_mode=exit_mode, rna_mass_kg=rna_mass_kg
                         )
-                        out_csv = append_foundation_results(wt_opt, modeling_options, extras=extras)
+                        out_csv = append_foundation_results(
+                            wt_opt,
+                            modeling_options,
+                            extras=extras,
+                            results_prefix=results_prefix,
+                        )
 
                     print(f"  OK -> {out_csv}")
                     if exit_mode is not None and exit_mode != 0:
@@ -2885,8 +2918,9 @@ def main(argv: list[str] | None = None) -> int:
         default="both",
         help=(
             "Jacket leg counts to run per scenario (default: both). "
-            "Three-legged results append to examples/results_jacket_3.csv; "
-            "four-legged results append to examples/results_jacket.csv. "
+            "By default, three-legged results append to examples/results_jacket_3.csv "
+            "and four-legged results to examples/results_jacket.csv. "
+            "Pass --doe-results to append to DOE_results_jacket_3.csv / DOE_results_jacket.csv instead. "
             "Optional site CSV column n_legs (3 or 4) overrides this for that row."
         ),
     )
@@ -2938,9 +2972,30 @@ def main(argv: list[str] | None = None) -> int:
         default=1.0,
         help="von Mises stress utilization threshold for --stress-diagnostics (default: 1.0).",
     )
+    parser.add_argument(
+        "--doe-results",
+        action="store_true",
+        help=(
+            "Append this run to examples/foundation_batch/DOE_results_jacket.csv, "
+            "DOE_results_jacket_3.csv, and DOE_results_monopile.csv instead of the "
+            "default examples/results_*.csv files. Other runs are unchanged unless "
+            "they also pass this flag."
+        ),
+    )
+    parser.add_argument(
+        "--results-prefix",
+        default=None,
+        metavar="PREFIX",
+        help=(
+            "Append to {PREFIX}_jacket.csv, {PREFIX}_jacket_3.csv, and "
+            "{PREFIX}_monopile.csv. A bare name is placed in examples/foundation_batch/; "
+            "a path is used as given. Overrides --doe-results."
+        ),
+    )
     args = parser.parse_args(argv)
     stress_diagnostics = args.stress_diagnostics or args.member_diagnostics
     buckling_diagnostics = args.buckling_diagnostics or args.member_diagnostics
+    results_prefix = resolve_results_prefix(args.doe_results, args.results_prefix)
     return run_batch(
         args.input_csv,
         turbine_csv=args.turbine_csv,
@@ -2953,6 +3008,7 @@ def main(argv: list[str] | None = None) -> int:
         buckling_diagnostics=buckling_diagnostics,
         buckling_util_threshold=args.buckling_util_threshold,
         stress_util_threshold=args.stress_util_threshold,
+        results_prefix=results_prefix,
     )
 
 

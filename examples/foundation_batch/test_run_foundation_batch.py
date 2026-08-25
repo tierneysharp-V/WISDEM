@@ -96,6 +96,44 @@ class TestFoundationBatchHelpers(unittest.TestCase):
         mo3 = {"flags": {"jacket": True}, "WISDEM": {"FixedBottomSE": {"n_legs": 3}}}
         self.assertTrue(csv_path_for_foundation_type("jacket", mo4).endswith("results_jacket.csv"))
         self.assertTrue(csv_path_for_foundation_type("jacket", mo3).endswith("results_jacket_3.csv"))
+        prefix = os.path.join(BATCH_DIR, "DOE_results")
+        self.assertEqual(
+            csv_path_for_foundation_type("jacket", mo4, results_prefix=prefix),
+            os.path.join(BATCH_DIR, "DOE_results_jacket.csv"),
+        )
+        self.assertEqual(
+            csv_path_for_foundation_type("jacket", mo3, results_prefix=prefix),
+            os.path.join(BATCH_DIR, "DOE_results_jacket_3.csv"),
+        )
+        self.assertEqual(
+            csv_path_for_foundation_type("monopile", results_prefix=prefix),
+            os.path.join(BATCH_DIR, "DOE_results_monopile.csv"),
+        )
+
+    def test_resolve_results_prefix(self):
+        self.assertIsNone(rfb.resolve_results_prefix())
+        self.assertEqual(rfb.resolve_results_prefix(doe_results=True), rfb.DOE_RESULTS_PREFIX)
+        self.assertEqual(
+            rfb.resolve_results_prefix(results_prefix="DOE_results"),
+            os.path.join(BATCH_DIR, "DOE_results"),
+        )
+        self.assertEqual(
+            rfb.resolve_results_prefix(doe_results=True, results_prefix="other"),
+            os.path.join(BATCH_DIR, "other"),
+        )
+
+    def test_doe_results_csvs_are_header_only(self):
+        for name, cols in (
+            ("DOE_results_jacket.csv", JACKET_CSV_COLUMNS),
+            ("DOE_results_jacket_3.csv", JACKET_CSV_COLUMNS),
+            ("DOE_results_monopile.csv", MONOPILE_CSV_COLUMNS),
+        ):
+            path = os.path.join(BATCH_DIR, name)
+            self.assertTrue(os.path.isfile(path), path)
+            with open(path, newline="", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            self.assertEqual(lines[0], ",".join(cols))
+            self.assertEqual(len(lines), 1)
 
     def test_apply_jacket_topology_preserves_three_legs(self):
         jacket = {"n_legs": 3, "brace_diameters": [1.0], "brace_thicknesses": [0.1]}

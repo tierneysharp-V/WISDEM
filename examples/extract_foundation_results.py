@@ -127,15 +127,32 @@ def columns_for_foundation_type(ftype):
     raise ValueError(f"Unknown foundation type '{ftype}'; expected jacket or monopile")
 
 
-def csv_path_for_foundation_type(ftype, modeling_options=None):
-    """Return the append-only CSV path for a detected foundation type."""
+def results_tag_for_foundation_type(ftype, modeling_options=None):
+    """Suffix used in results CSV names: jacket, jacket_3, or monopile."""
     if ftype == "jacket":
         if modeling_options is not None and _jacket_n_legs(modeling_options) == 3:
-            return JACKET_3_CSV_PATH
-        return JACKET_CSV_PATH
+            return "jacket_3"
+        return "jacket"
     if ftype == "monopile":
-        return MONOPILE_CSV_PATH
+        return "monopile"
     raise ValueError(f"Unknown foundation type '{ftype}'; expected jacket or monopile")
+
+
+def csv_path_for_foundation_type(ftype, modeling_options=None, results_prefix=None):
+    """Return the append-only CSV path for a detected foundation type.
+
+    results_prefix : optional stem such as ``.../DOE_results``. When set, the
+    file is ``{prefix}_{jacket|jacket_3|monopile}.csv`` instead of the default
+    ``examples/results_*.csv`` paths.
+    """
+    tag = results_tag_for_foundation_type(ftype, modeling_options)
+    if results_prefix:
+        return f"{results_prefix}_{tag}.csv"
+    if tag == "jacket_3":
+        return JACKET_3_CSV_PATH
+    if tag == "jacket":
+        return JACKET_CSV_PATH
+    return MONOPILE_CSV_PATH
 
 
 def _remap_existing_row(erow, columns):
@@ -207,13 +224,16 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
     return row
 
 
-def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=None):
+def append_foundation_results(
+    wt_opt, modeling_options, csv_path=None, extras=None, results_prefix=None
+):
     """
     Append one foundation-results row.
 
     If csv_path is None, routes automatically to results_jacket.csv,
     results_jacket_3.csv (three-legged jackets), or results_monopile.csv
-    based on modeling flags and n_legs.
+    based on modeling flags and n_legs. Pass results_prefix to write
+    ``{prefix}_{jacket|jacket_3|monopile}.csv`` instead.
 
     extras : optional dict of extra column values (e.g. loads, site params, RNA mass).
 
@@ -225,7 +245,9 @@ def append_foundation_results(wt_opt, modeling_options, csv_path=None, extras=No
     ftype = _detect_foundation_type(modeling_options)
     columns = columns_for_foundation_type(ftype)
     if csv_path is None:
-        csv_path = csv_path_for_foundation_type(ftype, modeling_options)
+        csv_path = csv_path_for_foundation_type(
+            ftype, modeling_options, results_prefix=results_prefix
+        )
 
     row = collect_foundation_row(wt_opt, modeling_options, extras=extras)
 
