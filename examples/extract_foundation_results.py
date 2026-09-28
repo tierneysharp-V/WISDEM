@@ -3,6 +3,7 @@ Append foundation structural metrics from a WISDEM run to type-specific CSVs.
 
 Monopile runs append to results_monopile.csv. Jacket runs append to
 results_jacket.csv (four legs) or results_jacket_3.csv (three legs).
+Full LCOE runs append to results_lcoe.csv.
 Foundation type and jacket leg count are detected from modeling flags/options.
 One row per run; unavailable columns are written blank (NaN).
 """
@@ -58,16 +59,42 @@ JACKET_CSV_COLUMNS = [
     "jacket_foot_radius_m",
     "leg_diameter_m",
     "leg_thickness_m",
+    "brace_diameter_m",
+    "brace_thickness_m",
     "jacket_mass_kg",
     "transition_piece_mass_kg",
     "total_foundation_mass_kg",
     "opt_exit_mode",
 ]
 
+LCOE_CSV_COLUMNS = [
+    "timestamp",
+    "turbine_rating_W",
+    "foundation_type",
+    "n_legs",
+    "V50_mps",
+    "Hs50_m",
+    "water_depth_m",
+    "soil_shear_modulus_Pa",
+    "monopile_mass_kg",
+    "jacket_mass_kg",
+    "transition_piece_mass_kg",
+    "total_foundation_mass_kg",
+    "foundation_cost_usd",
+    "turbine_aep_kWh",
+    "tcc_usd_per_kW",
+    "bos_usd_per_kW",
+    "opex_usd_per_kW_yr",
+    "lcoe_usd_per_kwh",
+    "lcoe_usd_per_mwh",
+    "bos_source",
+]
+
 _EXAMPLES_DIR = os.path.dirname(os.path.realpath(__file__))
 MONOPILE_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_monopile.csv")
 JACKET_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_jacket.csv")
 JACKET_3_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_jacket_3.csv")
+LCOE_CSV_PATH = os.path.join(_EXAMPLES_DIR, "results_lcoe.csv")
 
 
 def _jacket_n_legs(modeling_options):
@@ -186,6 +213,8 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
         row["jacket_foot_radius_m"] = _get_val(wt_opt, "fixedse.r_foot", units="m")
         row["leg_diameter_m"] = _get_val(wt_opt, "jacket.leg_diameter", units="m")
         row["leg_thickness_m"] = _get_val(wt_opt, "jacket.leg_thickness", units="m")
+        row["brace_diameter_m"] = _get_val(wt_opt, "jacket.brace_diameters", units="m")
+        row["brace_thickness_m"] = _get_val(wt_opt, "jacket.brace_thicknesses", units="m")
         row["transition_piece_mass_kg"] = tp_mass
         if np.isfinite(jacket_mass) and np.isfinite(tp_mass):
             row["total_foundation_mass_kg"] = jacket_mass + tp_mass
@@ -220,6 +249,18 @@ def collect_foundation_row(wt_opt, modeling_options, extras=None):
         for key, val in extras.items():
             if key in columns:
                 row[key] = val
+
+    env = (modeling_options or {}).get("Environment") or {}
+    if "water_depth_m" in columns and not np.isfinite(_scalar(row.get("water_depth_m"))):
+        wd = env.get("water_depth")
+        if wd is not None:
+            row["water_depth_m"] = float(wd)
+    if "soil_shear_modulus_Pa" in columns and not np.isfinite(
+        _scalar(row.get("soil_shear_modulus_Pa"))
+    ):
+        g = env.get("soil_shear_modulus")
+        if g is not None:
+            row["soil_shear_modulus_Pa"] = float(g)
 
     return row
 
@@ -293,8 +334,114 @@ def append_foundation_results(
     return csv_path
 
 
+def collect_lcoe_row(wt_opt, modeling_options, extras=None):
+    """Build one LCOE-results dict matching LCOE_CSV_COLUMNS."""
+    ftype = _detect_foundation_type(modeling_options)
+    row = {col: np.nan for col in LCOE_CSV_COLUMNS}
+    row["timestamp"] = datetime.now(timezone.utc).isoformat()
+    row["foundation_type"] = ftype if ftype in ("jacket", "monopile") else ""
+    if ftype == "jacket":
+        row["n_legs"] = _jacket_n_legs(modeling_options)
+        jacket_mass = _get_val(wt_opt, "fixedse.jacket_mass", units="kg")
+        tp_mass = _get_val(wt_opt, "jacket.transition_piece_mass", units="kg")
+        row["jacket_mass_kg"] = jacket_mass
+        row["transition_piece_mass_kg"] = tp_mass
+        row["foundation_cost_usd"] = _get_val(wt_opt, "fixedse.jacket_cost", units="USD")
+        if np.isfinite(jacket_mass) and np.isfinite(tp_mass):
+            row["total_foundation_mass_kg"] = jacket_mass + tp_mass
+        elif np.isfinite(jacket_mass):
+            row["total_foundation_mass_kg"] = jacket_mass
+    elif ftype == "monopile":
+        mono_mass = _get_val(wt_opt, "fixedse.monopile_mass", units="kg")
+        tp_mass = _get_val(wt_opt, "monopile.transition_piece_mass", units="kg")
+        grav_mass = _get_val(wt_opt, "monopile.gravity_foundation_mass", units="kg", default=0.0)
+        if not np.isfinite(grav_mass):
+            grav_mass = 0.0
+        row["transition_piece_mass_kg"] = tp_mass
+        row["foundation_cost_usd"] = _get_val(wt_opt, "fixedse.monopile_cost", units="USD")
+        if np.isfinite(mono_mass) and np.isfinite(tp_mass):
+            row["monopile_mass_kg"] = mono_mass - tp_mass - grav_mass
+            row["total_foundation_mass_kg"] = mono_mass
+        elif np.isfinite(mono_mass):
+            row["monopile_mass_kg"] = mono_mass
+            row["total_foundation_mass_kg"] = mono_mass
+
+    row["turbine_aep_kWh"] = _get_val(wt_opt, "financese.turbine_aep", units="kW*h")
+    row["tcc_usd_per_kW"] = _get_val(wt_opt, "financese.tcc_per_kW", units="USD/kW")
+    row["bos_usd_per_kW"] = _get_val(wt_opt, "financese.bos_per_kW", units="USD/kW")
+    row["opex_usd_per_kW_yr"] = _get_val(wt_opt, "financese.opex_per_kW", units="USD/kW/yr")
+    lcoe = _get_val(wt_opt, "financese.lcoe", units="USD/kW/h")
+    row["lcoe_usd_per_kwh"] = lcoe
+    if np.isfinite(lcoe):
+        row["lcoe_usd_per_mwh"] = lcoe * 1000.0
+
+    if extras:
+        for key, val in extras.items():
+            if key in LCOE_CSV_COLUMNS:
+                row[key] = val
+    return row
+
+
+def append_lcoe_results(wt_opt, modeling_options, csv_path=None, extras=None, results_prefix=None):
+    """
+    Append one full-WISDEM LCOE row to results_lcoe.csv (or ``{prefix}_lcoe.csv``).
+
+    extras : optional dict (site params, bos_source, rating, n_legs).
+
+    Returns
+    -------
+    str
+        Path to the CSV that was written.
+    """
+    columns = LCOE_CSV_COLUMNS
+    if csv_path is None:
+        csv_path = f"{results_prefix}_lcoe.csv" if results_prefix else LCOE_CSV_PATH
+
+    row = collect_lcoe_row(wt_opt, modeling_options, extras=extras)
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
+
+    if os.path.isfile(csv_path) and os.path.getsize(csv_path) > 0:
+        with open(csv_path, newline="", encoding="utf-8") as rf:
+            reader = csv.DictReader(rf)
+            header = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+        if header and header != columns:
+            with open(csv_path, "w", newline="", encoding="utf-8") as wf:
+                writer = csv.DictWriter(wf, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                for erow in existing_rows:
+                    writer.writerow(_remap_existing_row(erow, columns))
+            write_header = False
+        else:
+            write_header = False
+    else:
+        write_header = True
+
+    out = {}
+    for col in columns:
+        val = row.get(col, np.nan)
+        if isinstance(val, (float, np.floating)) and not np.isfinite(val):
+            out[col] = ""
+        elif isinstance(val, (np.integer,)):
+            out[col] = int(val)
+        elif isinstance(val, (float, np.floating)):
+            out[col] = float(val)
+        else:
+            out[col] = val
+
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(out)
+
+    print(f"Appended LCOE results to {csv_path}")
+    return csv_path
+
+
 if __name__ == "__main__":
     print("Import append_foundation_results(wt_opt, modeling_options) after run_wisdem.")
     print(f"Monopile CSV:  {MONOPILE_CSV_PATH}")
     print(f"Jacket CSV:    {JACKET_CSV_PATH}")
     print(f"Jacket 3-leg:  {JACKET_3_CSV_PATH}")
+    print(f"LCOE CSV:      {LCOE_CSV_PATH}")

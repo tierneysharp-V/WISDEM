@@ -6,12 +6,17 @@ Usage:
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation jacket
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation monopile
   python run_foundation_batch.py scenarios.csv --turbine-csv turbine_lookup.csv --foundation both
-  python run_foundation_batch.py DOE_scenarios_500.csv --doe-results
+  python run_foundation_batch.py DOE_scenarios_500_jacket.csv --foundation jacket --jacket-legs 4 --doe-results
+  python run_foundation_batch.py DOE_scenarios_500_monopile.csv --foundation monopile --doe-results
+  python run_foundation_batch.py scenarios.csv --foundation both --lcoe
+  python run_foundation_batch.py scenarios.csv --foundation both --lcoe-only
 
 Site CSV columns (required):
-  turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m
+  turbine_rating_W, V50_mps, Hs50_m
 
-Optional site CSV column:
+Optional site CSV columns:
+  soil_shear_modulus_Pa — monopile soil stiffness (modeling YAML default if omitted)
+  water_depth_m — site depth (modeling YAML default if omitted)
   n_legs — jacket leg count for this row (3 or 4). When omitted, --jacket-legs applies.
 
 Turbine lookup CSV:
@@ -25,10 +30,14 @@ Workflow per scenario:
   2. Stage 1: RotorSE+DriveSE compute RNA loads (V_mean = V50/7)
   3. Stage 2: Loading-driven monopile/jacket sizing with n_dlc=2
      - DLC1: rated GustETM RNA + rated_V
-     - DLC2: parked extreme RNA (feathered-disk drag) + Uref=V50
+     - DLC2: parked extreme RNA (IEC 61400-2 Cd=1.5 on blade area → disk Cd=0.05) + Uref=V50
   4. Frequency bounds from min/max rpm (soft-stiff; rated soft-stiff if band breached)
   5. Monopile/jacket: tower-scaled cold start -> preflight repair ->
      two-stage SLSQP; soil-only warm-start when a prior case matches
+  6. Optional --lcoe: merge the sized foundation onto the full turbine YAML and
+     run RotorSE+DriveSE+TowerSE+FixedBottomSE+ORBIT+PlantFinance (no re-opt).
+     --lcoe-only skips sizing and reuses tmp/geometry_{tag}_sized.yaml.
+
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ import importlib
 import importlib.util
 import math
 import os
+import shutil
 import sys
 import traceback
 from typing import Any
@@ -60,8 +70,6 @@ REQUIRED_COLUMNS = [
     "turbine_rating_W",
     "V50_mps",
     "Hs50_m",
-    "soil_shear_modulus_Pa",
-    "water_depth_m",
 ]
 
 # Scenario fields that must match for soil-only warm start (everything except G)
@@ -86,6 +94,7 @@ BASELINES = {
 }
 
 MODELING_ROTORSE = os.path.join(BATCH_DIR, "modeling_options_rotorse.yaml")
+MODELING_LCOE = os.path.join(BATCH_DIR, "modeling_options_lcoe.yaml")
 ANALYSIS_LOADS = os.path.join(BATCH_DIR, "analysis_options_loads.yaml")
 DEFAULT_TURBINE_CSV = os.path.join(BATCH_DIR, "turbine_lookup.csv")
 DOE_RESULTS_PREFIX = os.path.join(BATCH_DIR, "DOE_results")
@@ -98,9 +107,21 @@ _RATING_MATCH_ATOL = 1.0  # Watts
 # Lookup-CSV keys that must not be written into geometry YAML (schema / results-only).
 _LOOKUP_ONLY_KEYS = frozenset({"rna_mass_kg", "rna_mass", "turbine_rating_W"})
 
-# Early-design parked rotor: feathered blades as a low-Cd disk (not IEC DLC 6.x)
-PARKED_ROTOR_CD = 0.04
+# Parked RNA thrust: 0.5 * rho * Cd * A_disk * V50^2.
+# IEC 61400-1/3 DLC 6.x has no disk Cd (aeroelastic). IEC 61400-2 Case H uses
+# Cd=1.5 on blade projected area, so Cd_disk = 1.5 * (A_blades / A_disk).
+# Utility-scale planform solidity is ~0.03-0.05 (5-22 MW lookup turbines), not
+# the 0.08-0.13 band used for small rotors. That mapping is Cd_disk ~= 0.045-0.075
+# if the full chord faces the wind, and ~0.02 if blades are feathered (t/c).
+# 0.05 is the screening value: honest 61400-2 for these rotors, close to the
+# feathered-disk 0.04 that matched real jacket masses, high enough that parked
+# RNA can govern at large D and high V50 without making SLSQP infeasible.
+PARKED_ROTOR_CD = 0.05
 _G = 9.80665
+# IEC 61400-3 / 61400-3-1 deterministic extreme wave: 11.1 sqrt(Hs/g) <= T <= 14.3 sqrt(Hs/g).
+# WISDEM LinearWaves uses T as the regular-wave period for height Hs, so this range
+# applies directly. Midpoint coefficient 12.7 is the single screening value.
+IEC_EXTREME_WAVE_T_COEFF = 12.7
 
 
 def _ensure_wisdem_namespace():
@@ -214,11 +235,14 @@ def _setup_wisdem():
             f"braces={jacket_mod.JACKET_GLOBAL_BUCKLING_K_BRACE}"
         )
     sys.path.insert(0, EXAMPLES_DIR)
-    from extract_foundation_results import append_foundation_results  # noqa: E402
+    from extract_foundation_results import (  # noqa: E402
+        append_foundation_results,
+        append_lcoe_results,
+    )
 
     import wisdem.fixed_bottomse.conceptual_design_rules as cdr
 
-    return run_wisdem_mod.run_wisdem, append_foundation_results, cdr
+    return run_wisdem_mod.run_wisdem, append_foundation_results, append_lcoe_results, cdr
 
 
 def _is_blank(value: Any) -> bool:
@@ -232,6 +256,12 @@ def _is_blank(value: Any) -> bool:
 
 def _to_float(value: Any) -> float:
     return float(str(value).strip().replace(",", ""))
+
+
+def _optional_scenario_float(scenario: dict, key: str) -> float | None:
+    if _is_blank(scenario.get(key)):
+        return None
+    return _to_float(scenario[key])
 
 
 def _parse_cell(value: Any) -> Any:
@@ -447,6 +477,64 @@ def slim_sizing_geometry(full_wt: dict, foundation_type: str) -> dict:
         "control": copy.deepcopy(full_wt.get("control", {})),
     }
     return slim
+
+
+def merge_sized_foundation(full_wt: dict, sized_wt: dict, foundation_type: str) -> dict:
+    """
+    Copy the sized jacket/monopile onto a full turbine YAML (blades, hub, nacelle, tower).
+
+    Master reference YAMLs only ship a foundation on some turbines; foundation_batch
+    already grafted one on. This step replaces that seed with the sized geometry.
+    """
+    sized_comp = (sized_wt.get("components") or {}).get(foundation_type)
+    if sized_comp is None:
+        raise ValueError(f"Sized geometry missing components.{foundation_type}")
+    wt = copy.deepcopy(full_wt)
+    comps = wt.setdefault("components", {})
+    other = "jacket" if foundation_type == "monopile" else "monopile"
+    comps.pop(other, None)
+    comps.pop("floating", None)
+    comps[foundation_type] = copy.deepcopy(sized_comp)
+    return wt
+
+
+def apply_jacket_mass_user(wt: dict, mass_kg: float | None) -> dict:
+    """Lock jacket mass to the sizing result so ORBIT uses the batch mass."""
+    if mass_kg is None or not math.isfinite(float(mass_kg)) or float(mass_kg) <= 0.0:
+        return wt
+    out = copy.deepcopy(wt)
+    jacket = out.get("components", {}).get("jacket")
+    if jacket is None:
+        return wt
+    jacket["jacket_mass_user"] = float(mass_kg)
+    return out
+
+
+def sized_geometry_path(tag: str) -> str:
+    return os.path.join(TMP_DIR, f"geometry_{tag}_sized.yaml")
+
+
+def find_sized_geometry(tag: str, foundation_type: str) -> str:
+    """Locate a previously dumped sized foundation YAML (slim tower+foundation)."""
+    candidates = [sized_geometry_path(tag)]
+    if foundation_type == "monopile":
+        candidates.append(os.path.join(TMP_DIR, f"geometry_{tag}_embedment.yaml"))
+    candidates.append(os.path.join(TMP_DIR, f"outputs_{tag}_stage2", "refturb_output.yaml"))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        f"No sized {foundation_type} geometry for tag '{tag}'. "
+        "Run sizing first (without --lcoe-only), or pass --lcoe on a sizing run. "
+        "Looked for:\n  " + "\n  ".join(candidates)
+    )
+
+
+def dump_sized_geometry(wt_sized: dict, tag: str) -> str:
+    path = sized_geometry_path(tag)
+    dump_yaml(wt_sized, path)
+    print(f"  Sized geometry: {path}")
+    return path
 
 
 def lookup_turbine_column(
@@ -687,6 +775,21 @@ def dump_yaml(data: dict, path: str) -> None:
         yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+def extreme_wave_period(hs: float) -> float:
+    """
+    Regular-wave period T associated with significant wave height Hs.
+
+    IEC 61400-3 / 61400-3-1 (deterministic extreme wave):
+        11.1 * sqrt(Hs/g) <= T <= 14.3 * sqrt(Hs/g)
+    WISDEM LinearWaves treats Tsig as that regular-wave period (height = Hs),
+    so the midpoint T = 12.7 * sqrt(Hs/g) is used as a single screening value.
+    """
+    h = float(hs)
+    if h <= 0.0:
+        raise ValueError(f"Hs must be positive for IEC extreme-wave period, got {h}")
+    return IEC_EXTREME_WAVE_T_COEFF * math.sqrt(h / _G)
+
+
 def patch_environment(baseline: dict, scenario: dict, for_rotorse: bool = False) -> dict:
     """Copy modeling options and apply site environment fields."""
     opts = copy.deepcopy(baseline)
@@ -700,6 +803,9 @@ def patch_environment(baseline: dict, scenario: dict, for_rotorse: bool = False)
     for csv_col, yaml_key in mapping_env.items():
         if not _is_blank(scenario.get(csv_col)):
             env[yaml_key] = _to_float(scenario[csv_col])
+
+    if not _is_blank(scenario.get("Hs50_m")):
+        env["significant_wave_period"] = extreme_wave_period(_to_float(scenario["Hs50_m"]))
 
     # IEC: V_extreme50 = 1.4*Vref, V_mean = 0.2*Vref => V_mean = V50/7
     if for_rotorse and not _is_blank(scenario.get("V50_mps")):
@@ -718,7 +824,8 @@ def estimate_parked_extreme_loads(
     """
     Physics-light parked extreme RNA loads at V50 (early-design screening).
 
-    Fx = 0.5 * rho * Cd * A * V50^2 with Cd=PARKED_ROTOR_CD (feathered disk).
+    Fx = 0.5 * rho * Cd * A * V50^2 with Cd=PARKED_ROTOR_CD (IEC 61400-2 Case H
+    Cd=1.5 on blade projected area, mapped with MW-class solidity ~0.03-0.05).
     Fz = -mass * g; tower-top moments from r_cm × F; Uref = V50.
     """
     if _is_blank(scenario.get("V50_mps")):
@@ -2590,9 +2697,13 @@ def scenario_result_extras(
         "turbine_rating_W": _to_float(scenario["turbine_rating_W"]),
         "V50_mps": _to_float(scenario["V50_mps"]),
         "Hs50_m": _to_float(scenario["Hs50_m"]),
-        "soil_shear_modulus_Pa": _to_float(scenario["soil_shear_modulus_Pa"]),
-        "water_depth_m": _to_float(scenario["water_depth_m"]),
     }
+    soil_g = _optional_scenario_float(scenario, "soil_shear_modulus_Pa")
+    if soil_g is not None:
+        extras["soil_shear_modulus_Pa"] = soil_g
+    water_depth = _optional_scenario_float(scenario, "water_depth_m")
+    if water_depth is not None:
+        extras["water_depth_m"] = water_depth
     if rna_mass_kg is not None and not (isinstance(rna_mass_kg, float) and not math.isfinite(rna_mass_kg)):
         extras["rna_mass_kg"] = float(rna_mass_kg)
     if exit_mode is not None and not (isinstance(exit_mode, float) and not math.isfinite(exit_mode)):
@@ -2601,6 +2712,126 @@ def scenario_result_extras(
         except (TypeError, ValueError):
             extras["opt_exit_mode"] = exit_mode
     return extras
+
+
+def _is_orbit_capacity_error(exc: BaseException) -> bool:
+    """True when ORBIT cannot place the foundation (typical large-D monopile)."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        name = type(cur).__name__.lower()
+        msg = str(cur).lower()
+        if "vesselcapacity" in name or "vesselcapacity" in msg:
+            return True
+        if "orbit" in msg and ("capacity" in msg or "vessel" in msg):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def build_lcoe_modeling(foundation_type: str, scenario: dict) -> dict:
+    """Full-WISDEM modeling: RotorSE/DriveSE/TowerSE/FixedBottomSE + ORBIT + LCOE."""
+    modeling = patch_environment(load_yaml(MODELING_LCOE), scenario, for_rotorse=True)
+    fb = copy.deepcopy(load_yaml(BASELINES[foundation_type]["modeling"])["WISDEM"]["FixedBottomSE"])
+    fb["flag"] = True
+    modeling.setdefault("WISDEM", {})["FixedBottomSE"] = fb
+    modeling["WISDEM"]["n_dlc"] = 1
+    modeling["WISDEM"].setdefault("BOS", {})["flag"] = True
+    modeling["WISDEM"]["BOS"]["quiet"] = True
+    modeling["WISDEM"].setdefault("LCOE", {})["flag"] = True
+    modeling["WISDEM"]["OpEx"] = {"flag": False}
+    if foundation_type == "jacket":
+        modeling["WISDEM"]["FixedBottomSE"]["soil_springs"] = False
+    return modeling
+
+
+def run_lcoe_stage(
+    run_wisdem,
+    append_lcoe_results,
+    full_wt: dict,
+    sized_wt: dict,
+    scenario: dict,
+    foundation_type: str,
+    tag: str,
+    n_legs: int | None = None,
+    jacket_mass_kg: float | None = None,
+    results_prefix: str | None = None,
+) -> str:
+    """
+    Merge sized foundation onto the full turbine and run WISDEM once (no opt).
+
+    Foundation dimensions come from sizing. Jacket mass is locked via
+    jacket_mass_user when provided. Monopile mass is recomputed from D/t/H
+    (same FixedBottomSE equations as sizing).
+    """
+    wt = merge_sized_foundation(full_wt, sized_wt, foundation_type)
+    if foundation_type == "jacket":
+        wt = apply_jacket_mass_user(wt, jacket_mass_kg)
+
+    modeling = build_lcoe_modeling(foundation_type, scenario)
+    analysis = load_yaml(ANALYSIS_LOADS)
+    analysis.setdefault("general", {})
+    analysis["general"]["folder_output"] = os.path.join(TMP_DIR, f"outputs_{tag}_lcoe")
+    analysis["general"]["fname_output"] = "refturb_output"
+
+    modeling_out = os.path.join(TMP_DIR, f"modeling_{tag}_lcoe.yaml")
+    analysis_out = os.path.join(TMP_DIR, f"analysis_{tag}_lcoe.yaml")
+    wt_out = os.path.join(TMP_DIR, f"geometry_{tag}_lcoe.yaml")
+    dump_yaml(modeling, modeling_out)
+    dump_yaml(analysis, analysis_out)
+    dump_yaml(wt, wt_out)
+
+    print("  LCOE stage: full WISDEM run_only (RotorSE+DriveSE+TowerSE+FixedBottomSE+ORBIT) …")
+    print(f"  geometry: {wt_out}")
+    print(f"  modeling: {modeling_out}")
+    print(f"  outputs:  {analysis['general']['folder_output']}")
+
+    bos_source = "orbit"
+    try:
+        wt_opt, modeling_options, _ = run_wisdem(wt_out, modeling_out, analysis_out, run_only=True)
+    except Exception as exc:
+        if not _is_orbit_capacity_error(exc):
+            raise
+        print(
+            f"  ORBIT failed ({type(exc).__name__}: {exc}). "
+            "Retrying with BOS.flag=False (LCOE.bos_per_kW fallback)."
+        )
+        modeling["WISDEM"]["BOS"]["flag"] = False
+        dump_yaml(modeling, modeling_out)
+        wt_opt, modeling_options, _ = run_wisdem(wt_out, modeling_out, analysis_out, run_only=True)
+        bos_source = "lcoe_default"
+
+    extras = {
+        "turbine_rating_W": _to_float(scenario["turbine_rating_W"]),
+        "V50_mps": _to_float(scenario["V50_mps"]),
+        "Hs50_m": _to_float(scenario["Hs50_m"]),
+        "bos_source": bos_source,
+    }
+    soil_g = _optional_scenario_float(scenario, "soil_shear_modulus_Pa")
+    if soil_g is not None:
+        extras["soil_shear_modulus_Pa"] = soil_g
+    water_depth = _optional_scenario_float(scenario, "water_depth_m")
+    if water_depth is not None:
+        extras["water_depth_m"] = water_depth
+    if n_legs is not None:
+        extras["n_legs"] = int(n_legs)
+
+    out_csv = append_lcoe_results(
+        wt_opt, modeling_options, extras=extras, results_prefix=results_prefix
+    )
+    lcoe_mwh = _safe_get(wt_opt, "financese.lcoe", units="USD/kW/h")
+    if math.isfinite(lcoe_mwh):
+        lcoe_mwh *= 1000.0
+    aep = _safe_get(wt_opt, "financese.turbine_aep", units="kW*h")
+    tcc = _safe_get(wt_opt, "financese.tcc_per_kW", units="USD/kW")
+    bos = _safe_get(wt_opt, "financese.bos_per_kW", units="USD/kW")
+    print(
+        f"  LCOE={lcoe_mwh:.3f} USD/MWh  AEP={aep:.4g} kWh  "
+        f"TCC={tcc:.4g} USD/kW  BOS={bos:.4g} USD/kW ({bos_source})"
+    )
+    print(f"  OK LCOE -> {out_csv}")
+    return out_csv
 
 
 def resolve_results_prefix(doe_results: bool = False, results_prefix: str | None = None) -> str | None:
@@ -2631,9 +2862,11 @@ def run_batch(
     buckling_diagnostics: bool = False,
     buckling_util_threshold: float = 1.0,
     stress_util_threshold: float = 1.0,
+    run_lcoe: bool = False,
+    lcoe_only: bool = False,
     results_prefix: str | None = None,
 ) -> int:
-    run_wisdem, append_foundation_results, cdr = _setup_wisdem()
+    run_wisdem, append_foundation_results, append_lcoe_results, cdr = _setup_wisdem()
     scenarios = read_scenarios(csv_path)
     if row_filter is not None:
         scenarios = [s for s in scenarios if s.get("_csv_row_number") == row_filter]
@@ -2668,6 +2901,12 @@ def run_batch(
         print(f"  Jacket member diagnostics enabled when {' and '.join(parts)}")
     print(f"Turbine lookup: {turbine_csv} ({len(turbines)} turbine column(s))")
     print(f"Foundation mode(s): {', '.join(foundations)}")
+    if run_lcoe or lcoe_only:
+        print(
+            "  LCOE stage: "
+            + ("sized-geometry only (skip sizing)" if lcoe_only else "after each successful sizing")
+        )
+        print(f"  LCOE modeling: {MODELING_LCOE}")
     if results_prefix:
         print(f"Results CSVs: {results_prefix}_{{jacket,jacket_3,monopile}}.csv")
     else:
@@ -2706,6 +2945,27 @@ def run_batch(
                     )
                     if n_legs is not None:
                         full_wt = set_jacket_n_legs(full_wt, n_legs)
+
+                    if lcoe_only:
+                        sized_path = find_sized_geometry(tag, ftype)
+                        sized_wt = load_yaml(sized_path)
+                        leg_label = f", n_legs={n_legs}" if n_legs is not None else ""
+                        print(f"\n=== LCOE {ftype} CSV row {row_num}{leg_label} (skip sizing) ===")
+                        print(f"  Sized geometry: {sized_path}")
+                        run_lcoe_stage(
+                            run_wisdem,
+                            append_lcoe_results,
+                            full_wt,
+                            sized_wt,
+                            scenario,
+                            ftype,
+                            tag,
+                            n_legs=n_legs,
+                            results_prefix=results_prefix,
+                        )
+                        n_ok += 1
+                        continue
+
                     f_lo, f_hi = compute_frequency_bounds(full_wt)
 
                     # Stage 1: compute loads (reuse across 3/4-leg jacket runs on same row)
@@ -2739,9 +2999,11 @@ def run_batch(
                     site = cdr.resolve_site_params(modeling)
                     leg_label = f", n_legs={n_legs}" if n_legs is not None else ""
                     print(f"\n=== Sizing {ftype} scenario CSV row {row_num}{leg_label} ===")
+                    t_wave = modeling.get("Environment", {}).get("significant_wave_period")
+                    t_txt = f", T={t_wave:.3f} s" if t_wave is not None else ""
                     print(
                         f"  Site: WD={site['water_depth']:.3f} m, Hs={site['hs']:.3f} m, "
-                        f"H_free={site['H_free']:.3f} m"
+                        f"H_free={site['H_free']:.3f} m{t_txt}"
                     )
                     g_soil = modeling.get("Environment", {}).get("soil_shear_modulus", None)
                     if g_soil is not None:
@@ -2826,6 +3088,15 @@ def run_batch(
                             extras=extras,
                             results_prefix=results_prefix,
                         )
+                        embed_path = os.path.join(TMP_DIR, f"geometry_{tag}_embedment.yaml")
+                        if os.path.isfile(embed_path):
+                            shutil.copyfile(embed_path, sized_geometry_path(tag))
+                            print(f"  Sized geometry: {sized_geometry_path(tag)}")
+                            sized_wt = load_yaml(embed_path)
+                        else:
+                            raise FileNotFoundError(
+                                f"Missing monopile embedment YAML after sizing: {embed_path}"
+                            )
                     else:
                         wt_opt, modeling_options, exit_mode, j_dvs = run_jacket_two_stage(
                             run_wisdem,
@@ -2870,6 +3141,8 @@ def run_batch(
                             extras=extras,
                             results_prefix=results_prefix,
                         )
+                        sized_wt = seed_jacket_geometry(wt_geom, *j_dvs)
+                        dump_sized_geometry(sized_wt, tag)
 
                     print(f"  OK -> {out_csv}")
                     if exit_mode is not None and exit_mode != 0:
@@ -2877,6 +3150,22 @@ def run_batch(
                             f"  NOTE: optimizer exit_mode={exit_mode} "
                             "(0=success; 8=linesearch stuck; 9=iteration limit). "
                             "Row was still appended — check opt_exit_mode in CSV."
+                        )
+                    if run_lcoe:
+                        jacket_mass_kg = None
+                        if ftype == "jacket":
+                            jacket_mass_kg = _safe_get(wt_opt, "fixedse.jacket_mass", units="kg")
+                        run_lcoe_stage(
+                            run_wisdem,
+                            append_lcoe_results,
+                            full_wt,
+                            sized_wt,
+                            scenario,
+                            ftype,
+                            tag,
+                            n_legs=n_legs,
+                            jacket_mass_kg=jacket_mass_kg,
+                            results_prefix=results_prefix,
                         )
                     n_ok += 1
                 except Exception as exc:
@@ -2899,7 +3188,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "input_csv",
-        help="Site CSV with turbine_rating_W, V50_mps, Hs50_m, soil_shear_modulus_Pa, water_depth_m.",
+        help=(
+            "Site CSV with turbine_rating_W, V50_mps, Hs50_m. "
+            "Optional: soil_shear_modulus_Pa, water_depth_m, n_legs."
+        ),
     )
     parser.add_argument(
         "--turbine-csv",
@@ -2973,6 +3265,24 @@ def main(argv: list[str] | None = None) -> int:
         help="von Mises stress utilization threshold for --stress-diagnostics (default: 1.0).",
     )
     parser.add_argument(
+        "--lcoe",
+        action="store_true",
+        help=(
+            "After each successful sizing, merge the sized jacket/monopile onto the full "
+            "turbine YAML and run WISDEM once (RotorSE+DriveSE+TowerSE+FixedBottomSE+ORBIT+LCOE, "
+            "no re-opt). Results append to examples/results_lcoe.csv; OpenMDAO outputs go to "
+            "examples/foundation_batch/tmp/outputs_{tag}_lcoe/."
+        ),
+    )
+    parser.add_argument(
+        "--lcoe-only",
+        action="store_true",
+        help=(
+            "Skip foundation sizing. Reuse tmp/geometry_{tag}_sized.yaml (or the stage-2 / "
+            "embedment YAML from a previous run) and run the LCOE stage only."
+        ),
+    )
+    parser.add_argument(
         "--doe-results",
         action="store_true",
         help=(
@@ -2995,6 +3305,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     stress_diagnostics = args.stress_diagnostics or args.member_diagnostics
     buckling_diagnostics = args.buckling_diagnostics or args.member_diagnostics
+    run_lcoe = args.lcoe or args.lcoe_only
     results_prefix = resolve_results_prefix(args.doe_results, args.results_prefix)
     return run_batch(
         args.input_csv,
@@ -3008,6 +3319,8 @@ def main(argv: list[str] | None = None) -> int:
         buckling_diagnostics=buckling_diagnostics,
         buckling_util_threshold=args.buckling_util_threshold,
         stress_util_threshold=args.stress_util_threshold,
+        run_lcoe=run_lcoe,
+        lcoe_only=args.lcoe_only,
         results_prefix=results_prefix,
     )
 

@@ -80,6 +80,6 @@ Environment:
     water_dyn_viscosity: 1.3351e-3
     water_depth: 30.0
     significant_wave_height: 4.52
-    significant_wave_period: 9.45
+    significant_wave_period: 9.45  # overwritten at runtime: T = 12.7*sqrt(Hs/g) (IEC 61400-3)
     soil_shear_modulus: 140.e+6
     soil_poisson: 0.4
